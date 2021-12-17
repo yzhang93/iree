@@ -52,7 +52,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/SCF.h"
@@ -178,7 +178,7 @@ static Value createSubviewOp(OpBuilder &b, Location loc, unsigned resultRank,
 //   %buffer = hal.interface.binding.subspan .. : tensor<?xf32>
 //   %result = linalg.matmul ins(%lhs, %rhs : tensor<?x?xf32>, tensor<?x?xf32>)
 //       outs(%init : tensor<?x?xf32>) -> tensor<?x?xf32>
-//   %value = linalg.tensor_reshape %result [affine_map<(d0, d1) -> (d0, d1)]
+//   %value = tensor.collapse_shape %result [[0, 1]]
 //       : tensor<?x?xf32> into tensor<?xf32>
 //   flow.dispatch.tensor.store %value, %buffer[..] [..] [..]
 // ```
@@ -269,10 +269,9 @@ static Value getSubviewOpForTensorStoreOp(OpBuilder &b, Operation *storeOp,
   return subview;
 }
 
-/// Gets the reverse of a
-/// `linalg.tensor_expand_shape`/`linalg.tensor_collapse_shape` op to get a
-/// memref type that can be used for in-place computation of the result of a
-/// dispatch region.
+/// Gets the reverse of a `tensor.expand_shape`/`tensor.collapse_shape` op to
+/// get a memref type that can be used for in-place computation of the result
+/// of a dispatch region.
 template <typename TensorReshapeOpTy>
 static Value getReverseOfReshapeOp(OpBuilder &b, TensorReshapeOpTy reshapeOp,
                                    Value resultBuffer) {
@@ -280,7 +279,7 @@ static Value getReverseOfReshapeOp(OpBuilder &b, TensorReshapeOpTy reshapeOp,
       reshapeOp.getSrcType(), {},
       resultBuffer.getType().cast<MemRefType>().getMemorySpace());
   using ReverseReshapeOpTy = typename std::conditional<
-      std::is_same<TensorReshapeOpTy, linalg::TensorCollapseShapeOp>::value,
+      std::is_same<TensorReshapeOpTy, tensor::CollapseShapeOp>::value,
       memref::ExpandShapeOp, memref::CollapseShapeOp>::type;
   return b.create<ReverseReshapeOpTy>(reshapeOp.getLoc(), memrefType,
                                       resultBuffer, reshapeOp.reassociation());
@@ -365,7 +364,7 @@ static Value getInplaceResultBuffer(OpBuilder &b, OpResult resultValue,
                   IREE::LinalgExt::LinalgExtOp, tensor::InsertSliceOp,
                   vector::TransferWriteOp>(
                 [&](auto op) { return resultBuffer; })
-            .Case<linalg::TensorCollapseShapeOp, linalg::TensorExpandShapeOp>(
+            .Case<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(
                 [&](auto reshapeOp) {
                   return getReverseOfReshapeOp(b, reshapeOp, resultBuffer);
                 })
@@ -414,7 +413,7 @@ static Value getAliasingBufferForResult(OpBuilder &b,
                          loadOp.getMixedSizes(), loadOp.getMixedStrides());
 }
 
-/// Converts a `linalg.tensor_collapse/expand_shape` operation to a
+/// Converts a `tensor.collapse/expand_shape` operation to a
 /// `linalg.collapse/expand_shape` operation with the result aliasing the buffer
 /// for the operand.
 template <typename TensorReshapeOpTy>
@@ -431,7 +430,7 @@ static Value getAliasingBufferForReshapeResult(OpBuilder &b,
   auto reshapeResultType = getMemrefTypeForTensor(
       resultTensorType, {}, inputBufferType.getMemorySpace());
   using ReshapeOpTy = typename std::conditional<
-      std::is_same<TensorReshapeOpTy, linalg::TensorCollapseShapeOp>::value,
+      std::is_same<TensorReshapeOpTy, tensor::CollapseShapeOp>::value,
       memref::CollapseShapeOp, memref::ExpandShapeOp>::type;
   Value bufferReshape = b.create<ReshapeOpTy>(loc, reshapeResultType,
                                               inputBuffer, op.reassociation());
@@ -472,7 +471,7 @@ static SmallVector<Value, 4> getAliasingBuffersForResults(
             tensor::CastOp>([&](auto singleResultOp) -> SmallVector<Value, 4> {
         return {getAliasingBufferForResult(b, singleResultOp, bvm)};
       })
-      .Case<linalg::TensorCollapseShapeOp, linalg::TensorExpandShapeOp>(
+      .Case<tensor::CollapseShapeOp, tensor::ExpandShapeOp>(
           [&](auto reshapeOp) -> SmallVector<Value, 4> {
             return {getAliasingBufferForReshapeResult(b, reshapeOp, bvm)};
           })
@@ -943,8 +942,8 @@ void LinalgBufferizePass::runOnOperation() {
           }
           return convertScfIfOp(b, ifOp, bvm, plan);
         })
-        .Case<IREE::Flow::DispatchTensorLoadOp, linalg::TensorCollapseShapeOp,
-              linalg::TensorExpandShapeOp, tensor::ExtractSliceOp,
+        .Case<IREE::Flow::DispatchTensorLoadOp, tensor::CollapseShapeOp,
+              tensor::ExpandShapeOp, tensor::ExtractSliceOp,
               tensor::CastOp>([&](auto aliasingOp) {
           auto aliasingBuffers =
               getAliasingBuffersForResults(b, aliasingOp, bvm);

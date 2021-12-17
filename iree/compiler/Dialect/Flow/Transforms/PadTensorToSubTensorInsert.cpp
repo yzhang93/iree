@@ -14,7 +14,7 @@
 
 #include "iree/compiler/Dialect/Flow/Transforms/PassDetail.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
-#include "mlir/Dialect/Linalg/IR/LinalgOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -80,7 +80,7 @@ struct PadTensorOpConversion : public OpRewritePattern<linalg::PadTensorOp> {
       };
       expr = addValueOrAttr(expr, lowPad[dim]);
       expr = addValueOrAttr(expr, highPad[dim]);
-      Value v = linalg::applyMapToValues(
+      Value v = applyMapToValues(
           rewriter, loc, AffineMap::get(1, numSymbols, expr), mapValues)[0];
       if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
         outputShape.push_back(cst.getValue());
