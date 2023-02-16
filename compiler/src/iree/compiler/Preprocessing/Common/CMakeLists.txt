@@ -28,6 +28,7 @@ iree_cc_library(
   SRCS
     "ConvertConv2DToImg2Col.cpp"
     "GeneralizeConvolutions.cpp"
+    "ConvertConvToChannelsLast.cpp"
     "PadLinalgOps.cpp"
     "PassDetail.h"
     "Passes.cpp"
