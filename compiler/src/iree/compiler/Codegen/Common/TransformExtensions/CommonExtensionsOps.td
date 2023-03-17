@@ -288,6 +288,31 @@ def HoistStaticAllocOp :  Op<Transform_Dialect, "iree.hoist_static_alloc",
   }];
 }
 
+def GpuDistributeSharedMemoryCopyOp :  Op<Transform_Dialect, "iree.gpu_distribute_shared_memory_copy",
+    [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
+     TransformOpInterface, TransformEachOpTrait]> {
+  let summary = "Distribute shared memory copies";
+  let description = [{
+    Find shared memory copies, hoist them, and distribute the copy loops.
+
+    #### Return modes
+    This operation applies to the entire function. It always return success.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target);
+  let results = (outs TransformHandleTypeInterface:$result);
+
+  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
+  let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::func::FuncOp funcOp,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
 def IREEBufferizeOp : Op<Transform_Dialect, "iree.bufferize",
     [FunctionalStyleTransformOpTrait,
      MemoryEffectsOpInterface,
