@@ -721,7 +721,7 @@ struct RemoveDynamicCastOp final : public OpRewritePattern<memref::CastOp> {
     // Restrict to the cases we generate in this pass--1-D static shape to 1-D
     // dynamic shape.
     if (srcType.getRank() == 1 && srcType.hasStaticShape() &&
-        dstType.getRank() == 1 && !dstType.hasStaticShape()) {
+        dstType.getRank() == 1) {
       rewriter.replaceOp(castOp, castOp.getSource());
       return success();
     }
