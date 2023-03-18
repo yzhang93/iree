@@ -26,6 +26,8 @@ namespace LinalgExt {
 
 namespace {
 
+static const char scaleAttr[] = "iree_attention_scale";
+
 // Computes a reduction along the rows of a 2d tensor of shape MxN
 // to produce a tensor of shape M
 template <typename T>
@@ -137,17 +139,35 @@ static Value scaleAccumulator(Value accumulator, Value scaledOldSum,
   return genericOp.getResult(0);
 }
 
+static Value scaleQuery(Value query, Value scale, Value output, Location loc,
+                        OpBuilder &builder) {
+  AffineMap identityMap =
+      AffineMap::getMultiDimIdentityMap(2, builder.getContext());
+  SmallVector<AffineMap> indexingMaps{identityMap, identityMap};
+  SmallVector<utils::IteratorType> iteratorTypes(2,
+                                                 utils::IteratorType::parallel);
+  auto genericOp = builder.create<linalg::GenericOp>(
+      loc, output.getType(), query, output, indexingMaps, iteratorTypes,
+      [&](OpBuilder &b, Location loc, ValueRange args) {
+        Value result = b.create<arith::MulFOp>(loc, args[0], scale);
+        b.create<linalg::YieldOp>(loc, result);
+      });
+  return genericOp.getResult(0);
+}
+
 static Value computeQKTranspose(Value query, Value key, Value transposedOutput,
-                                Value output, Value zero,
-                                RankedTensorType tensorType, Location loc,
-                                OpBuilder &builder) {
+                                Value output, Value zero, Value scale,
+                                Value scaleOutput, RankedTensorType tensorType,
+                                Location loc, OpBuilder &builder) {
+  auto scaledQuery = scaleQuery(query, scale, scaleOutput, loc, builder);
   SmallVector<int64_t> perm{1, 0};
   auto transposeOp =
       builder.create<linalg::TransposeOp>(loc, key, transposedOutput, perm);
   Value acc =
       builder.create<linalg::FillOp>(loc, ValueRange{zero}, output).result();
   auto matmulOp = builder.create<linalg::MatmulOp>(
-      loc, tensorType, ValueRange{query, transposeOp.getResult()[0]}, acc);
+      loc, tensorType, ValueRange{scaledQuery, transposeOp.getResult()[0]},
+      acc);
   return matmulOp.getResult(0);
 }
 
@@ -239,8 +259,9 @@ static scf::LoopNest createLoopNest(SmallVectorImpl<Value> &ivs, Value lb,
 /// 3. for i = 0 to N with step T
 ///    a. Load a tile from the K matrix of size T x d -> k
 ///    a. Load a tile from the V matrix of size T x d -> v
+///    b. Scale(Q) -> αQ
 ///    b. Transpose(k) -> kT
-///    c. Compute matmul(q, kT) -> qkT
+///    c. Compute matmul(αq, kT) -> qkT
 ///    d. Compute sum(qkT) along rows -> current_sum
 ///    e. Compute max(qkT) along rows -> current_max
 ///    f. Compute new max: max(current_max, running_max)
@@ -320,7 +341,25 @@ LogicalResult reifyAttentionTransform(func::FuncOp funcOp) {
                       sequenceTileLength, elementType, loc, rewriter);
 
     // Compute matmul(q, transpose(k))
+    float attentionScale;
+    if (auto attr = attnOp->getAttrOfType<FloatAttr>(scaleAttr)) {
+      attentionScale = attr.getValue().convertToFloat();
+      if (attentionScale <= 0.0f)
+        return WalkResult::interrupt();
+    } else {
+      attentionScale = 1.0f;
+    }
+
+    Value scaleValue = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(elementType, attentionScale));
+
     auto headDimension = rewriter.getIndexAttr(queryShape.back());
+    SmallVector<OpFoldResult> originalShape{
+        sequenceTileLength,
+        headDimension,
+    };
+    Value emptyScale =
+        rewriter.create<tensor::EmptyOp>(loc, originalShape, elementType);
     SmallVector<OpFoldResult> transposedShape{headDimension,
                                               sequenceTileLength};
     Value empty =
@@ -333,7 +372,7 @@ LogicalResult reifyAttentionTransform(func::FuncOp funcOp) {
         SmallVector<int64_t>(2, ShapedType::kDynamic), elementType);
     Value qkTranspose =
         computeQKTranspose(querySlice, keySlice, empty, emptySquare, zeroF32,
-                           tensorType, loc, rewriter);
+                           scaleValue, emptyScale, tensorType, loc, rewriter);
 
     empty = rewriter.create<tensor::EmptyOp>(
         loc, SmallVector<OpFoldResult>{sequenceTileLength}, elementType);
