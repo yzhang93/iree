@@ -26,6 +26,8 @@ namespace LinalgExt {
 
 namespace {
 
+static const char attentionTileAttr[] = "attention_tile_sizes";
+
 // Computes a reduction along the rows of a 2d tensor of shape MxN
 // to produce a tensor of shape M
 template <typename T>
@@ -156,16 +158,17 @@ static Value computeQKTranspose(Value query, Value key, Value output,
 
 static std::tuple<Value, Value, Value, Value>
 extractSlices(Value key, Value value, Value query, Value output,
-              ArrayRef<int64_t> queryShape, ArrayRef<Value> ivs,
-              OpFoldResult sequenceTileLength, Type elementType, Location loc,
+              ArrayRef<int64_t> keyShape, ArrayRef<int64_t> queryShape,
+              ArrayRef<Value> ivs, OpFoldResult keyValueTileLength,
+              OpFoldResult queryTileLength, Type elementType, Location loc,
               OpBuilder &builder) {
   auto one = builder.getIndexAttr(1);
   auto zero = builder.getIndexAttr(0);
-  auto headDimension = builder.getIndexAttr(queryShape.back());
-  SmallVector<OpFoldResult> strides(queryShape.size(), one);
-  SmallVector<OpFoldResult> sizes(queryShape.size(), one);
-  SmallVector<OpFoldResult> offsets(queryShape.size(), zero);
-  sizes[1] = sequenceTileLength;
+  auto headDimension = builder.getIndexAttr(keyShape.back());
+  SmallVector<OpFoldResult> strides(keyShape.size(), one);
+  SmallVector<OpFoldResult> sizes(keyShape.size(), one);
+  SmallVector<OpFoldResult> offsets(keyShape.size(), zero);
+  sizes[1] = keyValueTileLength;
   sizes[2] = headDimension;
   offsets[0] = ivs[0];
   offsets[1] = ivs[1];
@@ -176,7 +179,11 @@ extractSlices(Value key, Value value, Value query, Value output,
   Value valueSlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, value, offsets, sizes, strides);
 
+  strides = SmallVector<OpFoldResult>(queryShape.size(), one);
+  sizes = SmallVector<OpFoldResult>(queryShape.size(), one);
   offsets = SmallVector<OpFoldResult>(queryShape.size(), zero);
+  sizes[1] = queryTileLength;
+  sizes[2] = headDimension;
   offsets[0] = ivs[0];
   Value querySlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, query, offsets, sizes, strides);
@@ -187,12 +194,12 @@ extractSlices(Value key, Value value, Value query, Value output,
 
 static std::tuple<Value, Value>
 extractStatSlices(Value max, Value sum, ArrayRef<int64_t> queryShape,
-                  OpFoldResult sequenceTileLength, Type elementType,
-                  Location loc, OpBuilder &builder) {
+                  OpFoldResult queryTileLength, Type elementType, Location loc,
+                  OpBuilder &builder) {
   auto one = builder.getIndexAttr(1);
   auto zero = builder.getIndexAttr(0);
   SmallVector<OpFoldResult> strides(2, one);
-  SmallVector<OpFoldResult> sizes{one, sequenceTileLength};
+  SmallVector<OpFoldResult> sizes{one, queryTileLength};
   SmallVector<OpFoldResult> offsets(2, zero);
   SmallVector<int64_t> tensorShape{queryShape[1]};
   auto tensorType = RankedTensorType::get(tensorShape, elementType);
@@ -206,7 +213,7 @@ extractStatSlices(Value max, Value sum, ArrayRef<int64_t> queryShape,
 static std::tuple<Value, Value, Value>
 insertSlices(Value newResult, Value result, Value newMax, Value max,
              Value newSum, Value sum, ArrayRef<int64_t> queryShape,
-             ArrayRef<Value> ivs, OpFoldResult sequenceTileLength, Location loc,
+             ArrayRef<Value> ivs, OpFoldResult queryTileLength, Location loc,
              OpBuilder &builder) {
   auto one = builder.getIndexAttr(1);
   auto zero = builder.getIndexAttr(0);
@@ -214,13 +221,13 @@ insertSlices(Value newResult, Value result, Value newMax, Value max,
   SmallVector<OpFoldResult> strides(queryShape.size(), one);
   SmallVector<OpFoldResult> sizes(queryShape.size(), one);
   SmallVector<OpFoldResult> offsets(queryShape.size(), zero);
-  sizes[1] = sequenceTileLength;
+  sizes[1] = queryTileLength;
   sizes[2] = headDimension;
   offsets[0] = ivs[0];
   Value updatedAcc = builder.create<tensor::InsertSliceOp>(
       loc, newResult, result, offsets, sizes, strides);
   offsets = SmallVector<OpFoldResult>(queryShape.size() - 1, zero);
-  sizes = SmallVector<OpFoldResult>{one, sequenceTileLength};
+  sizes = SmallVector<OpFoldResult>{one, queryTileLength};
   strides = SmallVector<OpFoldResult>(queryShape.size() - 1, one);
   Value updatedMax = builder.create<tensor::InsertSliceOp>(
       loc, newMax, max, offsets, sizes, strides);
@@ -244,24 +251,23 @@ static scf::LoopNest createLoopNest(SmallVectorImpl<Value> &ivs, Value lb,
   return loopNest;
 }
 
-static std::tuple<Value, Value, Value>
-createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
-                    Value outputSlice, Value maxSlice, Value sumSlice,
-                    OpFoldResult sequenceTileLength, OpFoldResult headDimension,
-                    Type elementType, SmallVectorImpl<Operation *> &ops,
-                    Location loc, OpBuilder &builder) {
+static std::tuple<Value, Value, Value> createAttentionBody(
+    Value keySlice, Value valueSlice, Value querySlice, Value outputSlice,
+    Value maxSlice, Value sumSlice, OpFoldResult keyValueTileLength,
+    OpFoldResult queryTileLength, OpFoldResult headDimension, Type elementType,
+    SmallVectorImpl<Operation *> &ops, Location loc, OpBuilder &builder) {
 
   // Compute matmul(q, transpose(k))
   Value zero =
       builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(elementType));
-  SmallVector<OpFoldResult> resultShape{sequenceTileLength, sequenceTileLength};
+  SmallVector<OpFoldResult> resultShape{queryTileLength, keyValueTileLength};
   Value emptySquare =
       builder.create<tensor::EmptyOp>(loc, resultShape, elementType);
   Value qkTranspose = computeQKTranspose(querySlice, keySlice, emptySquare,
                                          zero, loc, builder, ops);
 
   Value empty = builder.create<tensor::EmptyOp>(
-      loc, SmallVector<OpFoldResult>{sequenceTileLength}, elementType);
+      loc, SmallVector<OpFoldResult>{queryTileLength}, elementType);
 
   // Compute current statistics
   Value newMax = computeRowwiseReduction<arith::MaxFOp>(qkTranspose, maxSlice,
@@ -277,7 +283,7 @@ createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
 
   // Update accumulator
   empty = builder.create<tensor::EmptyOp>(
-      loc, SmallVector<OpFoldResult>{sequenceTileLength, headDimension},
+      loc, SmallVector<OpFoldResult>{queryTileLength, headDimension},
       elementType);
   Value scaledAcc = scaleAccumulator(outputSlice, scaledOldSum, newSum, empty,
                                      loc, builder, ops);
@@ -307,14 +313,29 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   SmallVector<OpFoldResult> queryDimValues =
       tensor::createDimValues(rewriter, loc, query);
   OpFoldResult headDimension = queryDimValues[2];
-  OpFoldResult sequenceTileLength = queryDimValues[1];
+  OpFoldResult queryTileLength = queryDimValues[1];
   OpFoldResult batchTileLength = queryDimValues[0];
 
   Value key = attnOp.getKey();
   Value value = attnOp.getValue();
+  ShapedType keyType = attnOp.getKeyType();
+  ArrayRef<int64_t> keyShape = keyType.getShape();
   SmallVector<OpFoldResult> keyDimValues =
       tensor::createDimValues(rewriter, loc, key);
   OpFoldResult sequenceLength = keyDimValues[1];
+
+  OpFoldResult keyValueTileLength;
+  if (auto arrayAttr = attnOp->getAttrOfType<ArrayAttr>(attentionTileAttr)) {
+    SmallVector<int64_t> values(arrayAttr.size());
+    for (auto [index, attr] : llvm::enumerate(arrayAttr)) {
+      values[index] = attr.cast<IntegerAttr>().getInt();
+    }
+    Value keyTile = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(rewriter.getIndexType(), values[2]));
+    keyValueTileLength = getAsOpFoldResult(keyTile);
+  } else {
+    keyValueTileLength = queryTileLength;
+  }
 
   // Construct first loop
   Value zeroValue = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -336,7 +357,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
       loc, rewriter.getZeroAttr(elementType));
   Value largeNegativeF32 = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getFloatAttr(elementType, -1.0e+30));
-  SmallVector<OpFoldResult> dims{rewriter.getIndexAttr(1), sequenceTileLength};
+  SmallVector<OpFoldResult> dims{rewriter.getIndexAttr(1), queryTileLength};
   Value max = rewriter.create<tensor::EmptyOp>(loc, dims, elementType);
   auto maxFill =
       rewriter.create<linalg::FillOp>(loc, ValueRange{largeNegativeF32}, max);
@@ -350,7 +371,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   // Construct second loop
   scf::LoopNest secondLoopNest = createLoopNest(
       ivs, zeroValue,
-      getValueOrCreateConstantIndexOp(rewriter, loc, sequenceTileLength),
+      getValueOrCreateConstantIndexOp(rewriter, loc, keyValueTileLength),
       getValueOrCreateConstantIndexOp(rewriter, loc, sequenceLength),
       ValueRange({iterArg, negativeMax, zeroSum}), loc, rewriter);
   ops.push_back(secondLoopNest.loops.back());
@@ -363,23 +384,24 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   rewriter.setInsertionPointToStart(secondLoopNest.loops.back().getBody());
 
   // Extract slices
-  auto [keySlice, valueSlice, querySlice, outputSlice] =
-      extractSlices(key, value, query, iterArgResult, queryShape, ivs,
-                    sequenceTileLength, elementType, loc, rewriter);
+  auto [keySlice, valueSlice, querySlice, outputSlice] = extractSlices(
+      key, value, query, iterArgResult, keyShape, queryShape, ivs,
+      keyValueTileLength, queryTileLength, elementType, loc, rewriter);
 
   auto [maxSlice, sumSlice] =
-      extractStatSlices(iterArgMax, iterArgSum, queryShape, sequenceTileLength,
+      extractStatSlices(iterArgMax, iterArgSum, queryShape, queryTileLength,
                         elementType, loc, rewriter);
 
   // Create body of innermost loop
   auto [result, newMax, newSum] = createAttentionBody(
       keySlice, valueSlice, querySlice, outputSlice, maxSlice, sumSlice,
-      sequenceTileLength, headDimension, elementType, ops, loc, rewriter);
+      keyValueTileLength, queryTileLength, headDimension, elementType, ops, loc,
+      rewriter);
 
   // Insert slices
-  auto [updatedAcc, updatedMax, updatedSum] = insertSlices(
-      result, iterArgResult, newMax, iterArgMax, newSum, iterArgSum, queryShape,
-      ivs, sequenceTileLength, loc, rewriter);
+  auto [updatedAcc, updatedMax, updatedSum] =
+      insertSlices(result, iterArgResult, newMax, iterArgMax, newSum,
+                   iterArgSum, queryShape, ivs, queryTileLength, loc, rewriter);
 
   if (scf::YieldOp yieldOp = dyn_cast<scf::YieldOp>(
           secondLoopNest.loops.back().getBody()->getTerminator())) {
@@ -406,16 +428,16 @@ namespace {
 /// The attention operator computes:
 /// matmul(softmax(matmul(Q, transpose(K))), V)
 /// where: Q is the query matrix [B x N x d]
-///        K is the key matrix   [B x N x d]
-///        V is the value matrix [B x N x d]
+///        K is the key matrix   [B x M x d]
+///        V is the value matrix [B x M x d]
 ///
 /// The core algorithm is as follows:
 /// For each element in B,
-/// 1. Load a tile from the Q matrix of size T x d -> q
+/// 1. Load a tile from the Q matrix of size T1 x d -> q
 /// 2. Initialize statistics: running_sum, running_max
-/// 3. for i = 0 to N with step T
-///    a. Load a tile from the K matrix of size T x d -> k
-///    a. Load a tile from the V matrix of size T x d -> v
+/// 3. for i = 0 to N with step T2
+///    a. Load a tile from the K matrix of size T2 x d -> k
+///    a. Load a tile from the V matrix of size T2 x d -> v
 ///    b. Transpose(k) -> kT
 ///    c. Compute matmul(q, kT) -> qkT
 ///    d. Compute sum(qkT) along rows -> current_sum

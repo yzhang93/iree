@@ -31,6 +31,8 @@ using namespace mlir;
 namespace IREE = mlir::iree_compiler::IREE;
 using namespace IREE::LinalgExt;
 
+static const char attentionTileAttr[] = "attention_tile_sizes";
+
 //===----------------------------------------------------------------------===//
 // Utility methods for tiling a linalg_ext operation that implements a
 // TiledOpInterface
@@ -399,8 +401,20 @@ void TilingInterfaceTilingPass::runOnOperation() {
       IREE::LinalgExt::LinalgTransformationFilter(
           StringAttr::get(context, "tiling_winograd_input_nhwc")));
 
+  SmallVector<int64_t> tile_sizes = {10, 30, 0};
+  funcOp.walk([&](IREE::LinalgExt::AttentionOp attnOp) {
+    auto arrayAttr = attnOp->getAttrOfType<ArrayAttr>(attentionTileAttr);
+    if (arrayAttr) {
+      for (auto [index, attr] : llvm::enumerate(arrayAttr)) {
+        tile_sizes[index] = attr.cast<IntegerAttr>().getInt();
+      }
+    }
+  });
+
   patterns.add<TilingInterfaceTilingPattern>(
-      context, linalg::LinalgTilingOptions().setTileSizes({10, 30, 0}),
+      context,
+      linalg::LinalgTilingOptions().setTileSizes(
+          {tile_sizes[0], tile_sizes[1], 0}),
       IREE::LinalgExt::LinalgTransformationFilter(
           StringAttr::get(context, "tiling_attention")));
 
