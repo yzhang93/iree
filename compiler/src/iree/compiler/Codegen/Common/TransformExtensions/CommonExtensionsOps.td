@@ -134,6 +134,9 @@ def ApplyPatternsOp : Op<Transform_Dialect, "iree.apply_patterns",
       - unroll_vectors_gpu_wmma: adds patterns that unroll vectors to a native tile
       size for GPUs with wmma operations. The size is currently hardcoded but
       should be refactored upstream and made pluggable.
+      - unroll_vectors_gpu_coop_mat: adds patterns that unroll vectors to a native tile
+      size for GPUs targeting cooperative matrix operations. The size is currently
+      hardcoded but should be refactored upstream and made pluggable.
 
 
     #### Return modes:
@@ -177,7 +180,8 @@ def ApplyPatternsOp : Op<Transform_Dialect, "iree.apply_patterns",
                        UnitAttr:$swapping_patterns,
                        UnitAttr:$tiling_canonicalization,
                        UnitAttr:$unroll_vectors_gpu_mma_sync,
-                       UnitAttr:$unroll_vectors_gpu_wmma);
+                       UnitAttr:$unroll_vectors_gpu_wmma,
+                       UnitAttr:$unroll_vectors_gpu_coop_mat);
   let results = (outs);
 
   let assemblyFormat = "$target attr-dict `:` functional-type($target, results)";
@@ -221,6 +225,9 @@ def ApplyPatternsToNestedOp : Op<Transform_Dialect, "iree.apply_patterns_to_nest
       - unroll_vectors_gpu_wmma: adds patterns that unroll vectors to a native tile
       size for GPUs with wmma operations. The size is currently hardcoded but
       should be refactored upstream and made pluggable.
+      - unroll_vectors_gpu_coop_mat: adds patterns that unroll vectors to a native tile
+      size for GPUs targeting cooperative matrix operations. The size is currently
+      hardcoded but should be refactored upstream and made pluggable.
 
 
     #### Return modes:
@@ -240,7 +247,8 @@ def ApplyPatternsToNestedOp : Op<Transform_Dialect, "iree.apply_patterns_to_nest
 
   let arguments = (ins PDL_Operation:$target,
                        UnitAttr:$unroll_vectors_gpu_mma_sync,
-                       UnitAttr:$unroll_vectors_gpu_wmma);
+                       UnitAttr:$unroll_vectors_gpu_wmma,
+                       UnitAttr:$unroll_vectors_gpu_coop_mat);
   let results = (outs);
 
   let assemblyFormat = "$target attr-dict `:` functional-type($target, results)";

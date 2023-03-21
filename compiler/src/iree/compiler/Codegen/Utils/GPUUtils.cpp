@@ -754,6 +754,93 @@ std::optional<SmallVector<int64_t>> getMmaNativeVectorSize(Operation *op) {
   return std::nullopt;
 }
 
+//===----------------------------------------------------------------------===//
+// getCooperativeOpVectorShape
+//===----------------------------------------------------------------------===//
+
+template <typename ExtOpTy>
+static Optional<SmallVector<int64_t>> getExtOpVectorShape(
+    ExtOpTy op, ArrayRef<int64_t> nativeShape) {
+  auto insert =
+      op.getOperand().template getDefiningOp<vector::InsertStridedSliceOp>();
+  if (!insert) return std::nullopt;
+
+  VectorType sliceType = insert.getSourceVectorType();
+  for (Operation *users : op->getUsers()) {
+    auto extract = dyn_cast<vector::ExtractStridedSliceOp>(users);
+    if (!extract) return std::nullopt;
+    auto vecType = extract.getResult().getType().cast<VectorType>();
+    if (!llvm::equal(sliceType.getShape(), vecType.getShape()))
+      return std::nullopt;
+  }
+
+  return llvm::to_vector(sliceType.getShape());
+}
+
+/// Returns vector shape matching native cooperative op sizes for unrolling
+/// high-D vectors.
+Optional<SmallVector<int64_t>> getCooperativeOpVectorShape(
+    Operation *op, ArrayRef<int64_t> nativeShape) {
+  // Unroll vector.contract ops according to native cooperative matrix size.
+  if (auto contractOp = dyn_cast<vector::ContractionOp>(op)) {
+    return llvm::to_vector(nativeShape);
+  }
+
+  // Unroll elementwise ops according to native cooperative matrix size.
+  if (OpTrait::hasElementwiseMappableTraits(op) && op->getNumResults() == 1) {
+    if (auto vecType = op->getResultTypes()[0].dyn_cast<VectorType>())
+      return llvm::to_vector(nativeShape.drop_back());  // Drop K dim size
+  }
+
+  // Unrolling vector.contract generates vector.{insert|extract}_strided_slice
+  // ops for the vector transfer ops associated with the original contract op.
+  // We can use those to figure out how to unroll transfer ops accordingly
+  // to match the native cooperative op sizes.
+  //
+  // A better way might be to inspect the SSA value chain to figure out how the
+  // transfer ops are used (e.g., for cooperative matrix A/B/C matrix) and use
+  // the corresponding cooperative matrix configuration.
+
+  if (auto writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
+    auto insert =
+        writeOp.getVector().getDefiningOp<vector::InsertStridedSliceOp>();
+    if (insert) {
+      return llvm::to_vector(insert.getSourceVectorType().getShape());
+    }
+
+    // There can exist vector.transfer_write for initializing output. Unroll
+    // them to native shape. Native shape is for ([B, ]M, N, K), here we only
+    // need ([B, ]M, N).
+    return llvm::to_vector(nativeShape.drop_back());
+  }
+
+  if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
+    auto sourceOp = op;
+    if (op->hasOneUse()) {
+      auto user = *op->user_begin();
+      if (isa<arith::ExtUIOp>(user) || isa<arith::ExtSIOp>(user))
+        sourceOp = user;
+    }
+
+    VectorType sliceType;
+    for (Operation *users : sourceOp->getUsers()) {
+      auto extract = dyn_cast<vector::ExtractStridedSliceOp>(users);
+      if (!extract) return std::nullopt;
+      auto vecType = extract.getResult().getType().cast<VectorType>();
+      if (sliceType && sliceType != vecType) return std::nullopt;
+      sliceType = vecType;
+    }
+    return llvm::to_vector(sliceType.getShape());
+  }
+
+  if (auto extOp = dyn_cast<arith::ExtSIOp>(op))
+    return getExtOpVectorShape<arith::ExtSIOp>(extOp, nativeShape);
+  if (auto extOp = dyn_cast<arith::ExtUIOp>(op))
+    return getExtOpVectorShape<arith::ExtUIOp>(extOp, nativeShape);
+
+  return std::nullopt;
+}
+
 bool hasSharedMemoryAddressSpace(MemRefType memrefType) {
   auto addrSpace =
       memrefType.getMemorySpace().dyn_cast_or_null<gpu::AddressSpaceAttr>();

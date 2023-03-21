@@ -61,6 +61,7 @@ struct ApplyPatternsOpPatterns {
   bool tilingCanonicalization = false;
   bool unrollVectorsGpuMmaSync = false;
   bool unrollVectorsGpuWmma = false;
+  bool unrollVectorsGpuCoopMat = false;
 };
 }  // namespace transform_dialect
 }  // namespace IREE
