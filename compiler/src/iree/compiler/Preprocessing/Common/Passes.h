@@ -20,6 +20,9 @@ namespace IREE {
 // using im2col tranformation.
 std::unique_ptr<Pass> createConvertConv2DToImg2ColPass();
 
+// A pass to generalize all conv-like ops.
+std::unique_ptr<Pass> createGeneralizeConvolutionsPass();
+
 // A pass to pad linalg ops to the next integer multiple of `paddingSize`.
 std::unique_ptr<Pass> createPadLinalgOpsToIntegerMultiplePass();
 

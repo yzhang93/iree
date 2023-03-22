@@ -15,6 +15,12 @@ def ConvertConv2DToImg2Col :
   let constructor = "mlir::iree_compiler::IREE::createConvertConv2DToImg2ColPass()";
 }
 
+def GeneralizeConvolutions :
+    Pass<"iree-preprocessing-generalize-convolutions", ""> {
+  let summary = "Generalize all convolution ops";
+  let constructor = "mlir::iree_compiler::IREE::createGeneralizeConvolutionsPass()";
+}
+
 def PadLinalgOps :
     Pass<"iree-preprocessing-pad-linalg-ops", ""> {
   let summary = "Pad linalg ops to the next integer multiple of paddingSize.";
