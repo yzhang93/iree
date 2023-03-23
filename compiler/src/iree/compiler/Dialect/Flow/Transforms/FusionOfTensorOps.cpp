@@ -261,6 +261,15 @@ struct FusionOfTensorOpsPass
             if (!producer) {
               return false;
             }
+            // Hack to turn off fusion in specific case
+            if (auto type = fusedOperand->get()
+                                .getType()
+                                .dyn_cast<RankedTensorType>()) {
+              auto shape = type.getShape();
+              if (shape.size() == 3 && shape[0] == 32 && shape[1] == 1080 &&
+                  shape[2] == 1920)
+                return false;
+            }
             // Do not fuse producer generic op if it has more than one user.
             if (auto producerGenericOp =
                     dyn_cast<linalg::GenericOp>(producer)) {
