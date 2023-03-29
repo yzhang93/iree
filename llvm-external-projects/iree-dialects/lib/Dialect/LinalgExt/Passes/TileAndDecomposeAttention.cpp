@@ -377,14 +377,14 @@ namespace {
 /// The attention operator computes:
 /// matmul(softmax(matmul(Q, transpose(K))), V)
 /// where: Q is the query matrix [B x N x d]
-///        K is the key matrix   [B x N x d]
-///        V is the value matrix [B x N x d]
+///        K is the key matrix   [B x M x d]
+///        V is the value matrix [B x M x d]
 ///
 /// The core algorithm is as follows:
 /// For each element in B,
 /// 1. Load a tile from the Q matrix of size T x d -> q
 /// 2. Initialize statistics: running_sum, running_max
-/// 3. for i = 0 to N with step T
+/// 3. for i = 0 to M with step T
 ///    a. Load a tile from the K matrix of size T x d -> k
 ///    a. Load a tile from the V matrix of size T x d -> v
 ///    b. Transpose(k) -> kT
