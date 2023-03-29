@@ -26,7 +26,7 @@ namespace LinalgExt {
 
 namespace {
 
-static const char attentionTileAttr[] = "attention_tile_sizes";
+static const char keyTileAttr[] = "attention_key_tile";
 
 // Computes a reduction along the rows of a 2d tensor of shape MxN
 // to produce a tensor of shape M
@@ -172,7 +172,7 @@ extractSlices(Value key, Value value, Value query, Value output,
   sizes[2] = headDimension;
   offsets[0] = ivs[0];
   offsets[1] = ivs[1];
-  SmallVector<int64_t> tensorShape{queryShape[1], queryShape[2]};
+  SmallVector<int64_t> tensorShape{ShapedType::kDynamic, keyShape.back()};
   auto tensorType = RankedTensorType::get(tensorShape, elementType);
   Value keySlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, key, offsets, sizes, strides);
@@ -300,13 +300,10 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   OpFoldResult sequenceLength = keyDimValues[1];
 
   OpFoldResult keyValueTileLength;
-  if (auto arrayAttr = attnOp->getAttrOfType<ArrayAttr>(attentionTileAttr)) {
-    SmallVector<int64_t> values(arrayAttr.size());
-    for (auto [index, attr] : llvm::enumerate(arrayAttr)) {
-      values[index] = attr.cast<IntegerAttr>().getInt();
-    }
+  if (auto attr = attnOp->getAttrOfType<IntegerAttr>(keyTileAttr)) {
+    int64_t value = attr.getInt();
     Value keyTile = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getIntegerAttr(rewriter.getIndexType(), values[2]));
+        loc, rewriter.getIntegerAttr(rewriter.getIndexType(), value));
     keyValueTileLength = getAsOpFoldResult(keyTile);
   } else {
     keyValueTileLength = queryTileLength;

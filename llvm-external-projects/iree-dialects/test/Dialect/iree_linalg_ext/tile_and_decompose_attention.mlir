@@ -101,7 +101,7 @@ func.func @attention(%query: tensor<192x1024x64xf32>, %key: tensor<192x1024x64xf
 
 func.func @cross_attention(%query: tensor<192x1024x64xf32>, %key: tensor<192x128x64xf32>, %value: tensor<192x128x64xf32>) -> tensor<192x1024x64xf32> {
   %0 = tensor.empty() : tensor<192x1024x64xf32>
-  %1 = iree_linalg_ext.attention {attention_tile_sizes = [10, 30, 20]} ins(%query, %key, %value : tensor<192x1024x64xf32>, tensor<192x128x64xf32>, tensor<192x128x64xf32>) outs(%0 : tensor<192x1024x64xf32>) -> tensor<192x1024x64xf32>
+  %1 = iree_linalg_ext.attention {attention_key_tile = 20} ins(%query, %key, %value : tensor<192x1024x64xf32>, tensor<192x128x64xf32>, tensor<192x128x64xf32>) outs(%0 : tensor<192x1024x64xf32>) -> tensor<192x1024x64xf32>
   return %1 : tensor<192x1024x64xf32>
 }
 
