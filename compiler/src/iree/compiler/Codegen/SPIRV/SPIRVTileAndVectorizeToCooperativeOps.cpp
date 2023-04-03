@@ -63,6 +63,47 @@ static SmallVector<int64_t> getTargetCooperativeOpSize(linalg::LinalgOp op) {
   return getTileSizes(op, 3);  // For native vector sizes
 }
 
+static Optional<SmallVector<int64_t>> getCooperativeMatrixNativeVectorSize(
+    SmallVector<int64_t> tileSizes, Operation *op) {
+  // Currently hardcode the size of wmma operation. When more cases are
+  // supported this should be picked based on what the backend supports.
+  int64_t m = tileSizes[tileSizes.size() - 3];
+  int64_t n = tileSizes[tileSizes.size() - 2];
+  int64_t k = tileSizes[tileSizes.size() - 1];
+  if (auto contract = dyn_cast<vector::ContractionOp>(op)) {
+    SmallVector<int64_t> nativeSize(contract.getIteratorTypes().size() - 3, 1);
+    nativeSize.append({m, n, k});
+    return nativeSize;
+  }
+  if (auto writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
+    SmallVector<int64_t> nativeSize(writeOp.getVectorType().getRank() - 2, 1);
+    nativeSize.append({m, n});
+    return nativeSize;
+  }
+  if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
+    // Transfer read ops may need different shapes based on how they are being
+    // used. For simplicity just match the shape used by the extract strided op.
+    VectorType sliceType;
+    for (Operation *users : op->getUsers()) {
+      auto extract = dyn_cast<vector::ExtractStridedSliceOp>(users);
+      if (!extract) return std::nullopt;
+      auto vecType = extract.getResult().getType().cast<VectorType>();
+      if (sliceType && sliceType != vecType) return std::nullopt;
+      sliceType = vecType;
+    }
+    return llvm::to_vector(sliceType.getShape());
+  }
+  if ((OpTrait::hasElementwiseMappableTraits(op) && op->getNumResults() == 1)) {
+    if (auto vecType = op->getResultTypes()[0].dyn_cast<VectorType>()) {
+      SmallVector<int64_t> nativeSize(vecType.getRank() - 2, 1);
+      // Map elementwise ops to the output shape.
+      nativeSize.append({m, n});
+      return nativeSize;
+    }
+  }
+  return std::nullopt;
+}
+
 /// Deduces required subgroup counts along all workgroup tiled dimensions.
 ///
 /// `op` should be an operation with a `lowering_config` attribute to specify
@@ -430,8 +471,22 @@ class SPIRVVectorizeToCooperativeOpsPass final
     });
 
     {
+      auto unrollOrder = [](Operation *op) -> Optional<SmallVector<int64_t>> {
+        auto contract = dyn_cast<vector::ContractionOp>(op);
+        if (!contract) return std::nullopt;
+        return mlir::iree_compiler::gpuMmaUnrollOrder(contract);
+      };
+
+      auto getGPUNativeCooperativeMatrixVectorSize =
+          [cooperativeOpSize](Operation *op) -> Optional<SmallVector<int64_t>> {
+        return getCooperativeMatrixNativeVectorSize(cooperativeOpSize, op);
+      };
       RewritePatternSet vectorUnrollPatterns(context);
-      populateVectorUnrollPatterns(cooperativeOpSize, vectorUnrollPatterns);
+      populateVectorUnrollPatterns(
+          vectorUnrollPatterns,
+          vector::UnrollVectorOptions()
+              .setNativeShapeFn(getGPUNativeCooperativeMatrixVectorSize)
+              .setUnrollTraversalOrderFn(unrollOrder));
       if (failed(applyPatternsAndFoldGreedily(
               funcOp, std::move(vectorUnrollPatterns)))) {
         return signalPassFailure();
