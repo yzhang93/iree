@@ -37,6 +37,7 @@ constexpr unsigned AMDNumMNTilesPerSubgroup = 8;
 
 static LogicalResult setAMDMatmulConfig(linalg::LinalgOp op,
                                         const spirv::TargetEnv &targetEnv) {
+  if (op.getNumReductionLoops() != 1) return failure();
   if (succeeded(setCooperativeMatrixConfig(
           targetEnv, op, AMDNumSubgroupsPerWorkgroup, AMDNumMNTilesPerSubgroup,
           AMDCoopMatrixSoftwarePipelineDepth,
