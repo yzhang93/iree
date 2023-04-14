@@ -1072,7 +1072,7 @@ DiagnosedSilenceableFailure transform_dialect::IREEBufferizeOp::apply(
     // TODO(#12933): Because of regressions in CUDA backend, there is an
     // option to keep a legacy mode of not representing the offset in the
     // type. Remove once the bug is fixed.
-    options.embedSubspanOffsetIntoMemRefType = false;
+    options.embedSubspanOffsetIntoMemRefType = true;
   }
   if (failed(runIREEOneShotBufferize(state.getTopLevel(), options)))
     return listener.check(loc, emitDefaultDefiniteFailure(target));
