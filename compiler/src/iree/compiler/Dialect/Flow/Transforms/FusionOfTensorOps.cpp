@@ -269,6 +269,19 @@ struct FusionOfTensorOpsPass
               if (shape.size() == 3 && shape[0] == 32 && shape[1] == 1080 &&
                   shape[2] == 1920)
                 return false;
+
+              Value fusedVal = fusedOperand->get();
+              if (fusedVal.hasOneUse()) {
+                if (auto expand = dyn_cast<tensor::ExpandShapeOp>(
+                        *fusedVal.user_begin())) {
+                  auto expandShape = expand.getResultType().getShape();
+                  if (expandShape.size() == 7 && expandShape[0] == 2 &&
+                      expandShape[1] == 1 && expandShape[2] == 1080 &&
+                      expandShape[3] == 1920 && expandShape[4] == 4 &&
+                      expandShape[5] == 2 && expandShape[6] == 2)
+                    return false;
+                }
+              }
             }
             // Do not fuse producer generic op if it has more than one user.
             if (auto producerGenericOp =
