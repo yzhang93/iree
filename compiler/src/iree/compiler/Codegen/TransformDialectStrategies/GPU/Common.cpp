@@ -13,6 +13,7 @@
 #include "iree/compiler/Codegen/TransformDialectStrategies/GPU/AbstractConvolutionStrategy.h"
 #include "iree/compiler/Codegen/TransformDialectStrategies/GPU/AbstractReductionStrategy.h"
 #include "iree/compiler/Codegen/TransformDialectStrategies/GPU/ConvolutionImplicitGemmStrategy.h"
+#include "iree/compiler/Codegen/TransformDialectStrategies/GPU/ConvolutionPaddedImplicitGemmStrategy.h"
 #include "iree/compiler/Codegen/TransformDialectStrategies/GPU/MatmulTensorCoreStrategy.h"
 #include "iree/compiler/Codegen/TransformDialectStrategies/GPU/SmallReductionStrategy.h"
 #include "iree/compiler/Codegen/TransformDialectStrategies/GPU/StagedReductionStrategy.h"
@@ -67,6 +68,7 @@ using iree_compiler::gpu::buildSmallReductionStrategy;
 using iree_compiler::gpu::buildStagedReductionStrategy;
 using iree_compiler::gpu::ConvolutionConfig;
 using iree_compiler::gpu::ConvolutionImplicitGemmStrategy;
+using iree_compiler::gpu::ConvolutionPaddedImplicitGemmStrategy;
 using iree_compiler::gpu::ConvolutionStrategy;
 using iree_compiler::gpu::GPUModel;
 using iree_compiler::gpu::kCudaMaxNumThreads;
@@ -562,6 +564,11 @@ static ConvolutionConfig getConvolutionConfig(
   int64_t vectorSize = scaleUpByBitWidth(4, bitWidth);
   int64_t maxNumThreads = 8 * gpuModel.subgroupSize;
   int64_t subgroupSize = gpuModel.subgroupSize;
+
+  if (!captures.padOpSizes.empty())
+    return ConvolutionConfig{maxNumThreads, vectorSize, subgroupSize,
+                             gpuModel.isSpirv,
+                             ConvolutionStrategy::PaddedImplicitGemm};
   return ConvolutionConfig{maxNumThreads, vectorSize, subgroupSize, gpuModel.isSpirv,
                          ConvolutionStrategy::ImplicitGemm};
 }
@@ -654,6 +661,11 @@ LogicalResult mlir::iree_compiler::gpu::matchAndSetConvolutionStrategy(
       auto strategy = ConvolutionImplicitGemmStrategy::create(op->getContext(), captures,
                                                      convolutionConfig);
       return buildConvolutionImplicitGemmStrategy(b, variant, strategy);
+    } else if (convolutionConfig.strategy ==
+               ConvolutionStrategy::PaddedImplicitGemm) {
+      auto strategy = ConvolutionPaddedImplicitGemmStrategy::create(
+          op->getContext(), captures, convolutionConfig);
+      return buildConvolutionPaddedImplicitGemmStrategy(b, variant, strategy);
     } else {
       return llvm_unreachable("Unknown strategy");
     }

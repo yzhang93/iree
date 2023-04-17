@@ -15,7 +15,7 @@ namespace mlir {
 namespace iree_compiler {
 namespace gpu {
 
-enum class ConvolutionStrategy { ImplicitGemm };
+enum class ConvolutionStrategy { ImplicitGemm, PaddedImplicitGemm };
 struct ConvolutionConfig {
   int64_t maxNumThreads;
   int64_t vectorSize;

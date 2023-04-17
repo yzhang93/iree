@@ -111,6 +111,54 @@ bool transform_ext::ValueMatcher::match(Value value) {
 }
 
 //===---------------------------------------------------------------------===//
+// PadOpMatcher.
+//===---------------------------------------------------------------------===//
+
+bool transform_ext::PadOpMatcher::match(Operation *op) {
+  auto debugRAII =
+      llvm::make_scope_exit([] { LLVM_DEBUG(DBGS() << "-------\n"); });
+  LLVM_DEBUG(DBGS() << "matching: " << *op << "\n");
+
+  if (getCaptured()) {
+    LLVM_DEBUG(DBGS() << "found an already captured op: ");
+    if (getCaptured() == op) {
+      LLVM_DEBUG(llvm::dbgs() << "same\n");
+      return true;
+    } else {
+      LLVM_DEBUG(llvm::dbgs() << "different\n");
+      return false;
+    }
+  }
+
+  auto padOp = dyn_cast<tensor::PadOp>(op);
+  if (!padOp) {
+    LLVM_DEBUG(DBGS() << "not a pad op\n");
+    return false;
+  }
+
+  if (!llvm::all_of(predicates, [padOp](const PredicateFn &fn) {
+        bool result = fn(padOp);
+        LLVM_DEBUG(llvm::dbgs() << ": " << result << "\n");
+        return result;
+      })) {
+    return false;
+  }
+
+  captured = padOp;
+  return true;
+}
+
+transform_ext::PadOpMatcher &
+transform_ext::PadOpMatcher::padDims(AllDims tag, CaptureDims captures) {
+  predicates.push_back([=](tensor::PadOp padOp) -> bool {
+    LLVM_DEBUG(DBGS() << "capture all pad dimensions");
+    captures.value = SmallVector<int64_t>(padOp.getSourceType().getShape());
+    return true;
+  });
+  return *this;
+}
+
+//===---------------------------------------------------------------------===//
 // StructuredOpMatcher and friends.
 //===---------------------------------------------------------------------===//
 
@@ -1256,6 +1304,7 @@ void transform_ext::makeSoftmaxMatcher(
 void transform_ext::makeConvolutionMatcher(
     transform_ext::MatcherContext &matcherContext,
     transform_ext::StructuredOpMatcher *&convolutionCapture,
+    transform_ext::PadOpMatcher *&padCapture,
     transform_ext::StructuredOpMatcher *&fillCapture,
     transform_ext::StructuredOpMatcher *&trailingCapture,
     MatchedConvolutionCaptures &captures) {
@@ -1280,6 +1329,12 @@ void transform_ext::makeConvolutionMatcher(
   convolution =
       convolution.output(NumEqualsTo(1)).output(0, fill, OptionalMatch());
   fillCapture = &fill;
+
+  // Optional PadOp on the input.
+  auto &pad = m_PadOp(matcherContext)
+                  .padDims(AllDims(), CaptureDims(captures.padOpSizes));
+  convolution = convolution.input(0, pad, OptionalMatch());
+  padCapture = &pad;
 
   // Optional trailing op can be any map, transpose, broadcast but
   // not reduce or windowing operation for now.
@@ -1308,7 +1363,9 @@ void transform_ext::makeConvolutionMatcher(
     transform_ext::MatcherContext &context,
     StructuredOpMatcher *&convolutionCapture,
     MatchedConvolutionCaptures &captures) {
+  PadOpMatcher *pad;
   StructuredOpMatcher *fill;
   StructuredOpMatcher *trailing;
-  makeConvolutionMatcher(context, convolutionCapture, fill, trailing, captures);
+  makeConvolutionMatcher(context, convolutionCapture, pad, fill, trailing,
+                         captures);
 }

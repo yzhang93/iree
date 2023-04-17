@@ -12,6 +12,7 @@
 #include <functional>
 
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/IR/TransformInterfaces.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -25,8 +26,11 @@ namespace transform_ext {
 //===---------------------------------------------------------------------===//
 
 class StructuredOpMatcher;
+class PadOpMatcher;
 class MatcherContext;
 StructuredOpMatcher &m_StructuredOp(MatcherContext &);
+
+PadOpMatcher &m_PadOp(MatcherContext &);
 
 /// A tag indicating the shape being static or dynamic, for use with the
 /// structured op matcher.
@@ -284,7 +288,7 @@ private:
 
 protected:
   /// Matched value.
-  linalg::LinalgOp captured = nullptr;
+  Operation *captured = nullptr;
 };
 
 /// Structured op matcher with additional predicates attachable through the
@@ -374,6 +378,7 @@ public:
   StructuredOpMatcher &rank(CaptureRank capture);
   StructuredOpMatcher &dim(int64_t dimension, CaptureDim capture);
   StructuredOpMatcher &dim(AllDims tag, CaptureDims captures);
+  StructuredOpMatcher &padDims(AllDims tag, CaptureDims captures);
   StructuredOpMatcher &convolutionDims(CaptureConvDims convDims);
 
   //===-------------------------------------------------------------------===//
@@ -644,6 +649,48 @@ inline StructuredOpMatcher &m_StructuredOp(MatcherContext &matcherContext) {
 }
 
 //===---------------------------------------------------------------------===//
+// Pad Op Matcher
+//===---------------------------------------------------------------------===//
+
+class PadOpMatcher : public CapturingOpMatcher {
+  friend class MatcherContext;
+
+  using PredicateFn = std::function<bool(tensor::PadOp)>;
+  using CaptureResetFn = std::function<void()>;
+  using GetCapturedFn = std::function<Operation *()>;
+
+  PadOpMatcher() = default;
+
+  /// Matches a structured operation if the given predicate is satisfied.
+  PadOpMatcher(PredicateFn &&firstPredicate) {
+    predicates.push_back(std::move(firstPredicate));
+  }
+
+public:
+  /// Creates a matcher for a structured operation with one of the given types.
+  static PadOpMatcher create() {
+    return PadOpMatcher([](tensor::PadOp op) { return true; });
+  }
+
+  /// Matches the given operation, hook for `matchPattern`.
+  bool match(Operation *op);
+
+  //===-------------------------------------------------------------------===//
+  // Capture directives.
+  //===-------------------------------------------------------------------===//
+  PadOpMatcher &padDims(AllDims tag, CaptureDims captures);
+
+private:
+  /// Additional predicates to be checked on the pad op.
+  SmallVector<PredicateFn> predicates;
+};
+
+/// Creates a matcher of a pad op.
+inline PadOpMatcher &m_PadOp(MatcherContext &matcherContext) {
+  return matcherContext.allocate<PadOpMatcher>();
+}
+
+//===---------------------------------------------------------------------===//
 // MatchCallback functionality.
 //===---------------------------------------------------------------------===//
 
@@ -792,6 +839,7 @@ struct MatchedConvolutionCaptures {
   mlir::linalg::detail::ConvolutionDimensions convolutionDims = {};
   SmallVector<int64_t> convolutionOpSizes = {};
   SmallVector<int64_t> trailingOpSizes = {};
+  SmallVector<int64_t> padOpSizes = {};
   int64_t convolutionOutputElementalTypeBitWidth = 0;
   int64_t maybeTrailingOutputElementalTypeBitWidth = 0;
   int64_t maybeFillElementalTypeBitWidth = 0;
@@ -805,6 +853,7 @@ struct MatchedConvolutionCaptures {
 /// which is optional. Each matcher will capture the corresponding operation.
 void makeConvolutionMatcher(transform_ext::MatcherContext &context,
                             StructuredOpMatcher *&convolutionCapture,
+                            PadOpMatcher *&padCapture,
                             StructuredOpMatcher *&fillCapture,
                             StructuredOpMatcher *&trailingCapture,
                             MatchedConvolutionCaptures &captures);

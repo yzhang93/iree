@@ -583,7 +583,9 @@ static bool isFusableWithProducer(
   }
 
   if (options.fusePadWithConsumers && isa<tensor::PadOp>(producer) &&
-      isa<linalg::ConvolutionOpInterface>(consumer)) {
+      getMatchConvolutionMessage(
+          linalg::detail::isConvolutionInterfaceImpl(consumer))
+          .empty()) {
     return true;
   }
 
