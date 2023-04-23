@@ -47,6 +47,9 @@ const int bankConflictReductionPaddingBits = 128;
 /// Sets CodeGen configurations via attributes to the given convolution
 /// `linalgOp` by trying to achieve the given `bestTilingFactor`, which is how
 /// many scalar elements each thread should handle.
+LogicalResult setConvOpTransformConfig(linalg::LinalgOp linalgOp,
+                                       const int64_t subgroupSize,
+                                       const int64_t bestTilingFactor);
 LogicalResult setConvOpConfig(linalg::LinalgOp linalgOp,
                               const int64_t subgroupSize,
                               const int64_t bestTilingFactor);

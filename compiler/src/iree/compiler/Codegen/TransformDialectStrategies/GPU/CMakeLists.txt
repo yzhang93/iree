@@ -14,13 +14,16 @@ iree_cc_library(
   NAME
     TransformDialectStrategies
   HDRS
+    "AbstractConvolutionStrategy.h"
     "AbstractReductionStrategy.h"
     "Common.h"
+    "ConvolutionImplicitGemmStrategy.h"
     "MatmulTensorCoreStrategy.h"
     "SmallReductionStrategy.h"
     "StagedReductionStrategy.h"
   SRCS
     "Common.cpp"
+    "ConvolutionImplicitGemmStrategy.cpp"
     "MatmulTensorCoreStrategy.cpp"
     "SmallReductionStrategy.cpp"
     "StagedReductionStrategy.cpp"

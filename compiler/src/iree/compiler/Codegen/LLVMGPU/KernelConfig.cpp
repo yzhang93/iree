@@ -66,6 +66,13 @@ llvm::cl::opt<bool> clGPUUseMMASync(
     llvm::cl::desc("force use mma sync instead of wmma ops"),
     llvm::cl::init(false));
 
+/// Flag used to toggle using mma.sync vs wmma when targetting tensorcore.
+llvm::cl::opt<bool> clGPUEnableImplicitGemm(
+    "iree-codegen-llvmgpu-enable-implicit-gemm",
+    llvm::cl::desc(
+        "enable the transform dialect implementation of implicit gemm"),
+    llvm::cl::init(false));
+
 }  // namespace iree_compiler
 }  // namespace mlir
 

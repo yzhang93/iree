@@ -13,6 +13,7 @@
 #include "iree/compiler/Codegen/Common/UserConfig.h"
 #include "iree/compiler/Codegen/Dialect/LoweringConfig.h"
 #include "iree/compiler/Codegen/SPIRV/Utils.h"
+#include "iree/compiler/Codegen/TransformDialectStrategies/GPU/Common.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -48,6 +49,11 @@ llvm::cl::opt<std::string> clSPIRVCodegenTransformDialectFileName(
     llvm::cl::desc(
         "MLIR file containing a transform dialect specification to apply"),
     llvm::cl::init(""));
+
+llvm::cl::opt<bool> clSPIRVEnableTransformDialectJit(
+    "iree-codegen-spirv-enable-transform-dialect-jit",
+    llvm::cl::desc("enable the usage of the transform dialect JIT"),
+    llvm::cl::init(false));
 
 using CodeGenPipeline = IREE::Codegen::DispatchLoweringPassPipeline;
 
@@ -162,11 +168,39 @@ static bool tileConvSquare(const int64_t oh, const int64_t ow,
 
 namespace detail {
 
+LogicalResult setConvOpTransformConfig(linalg::LinalgOp linalgOp,
+                                       const int64_t subgroupSize,
+                                       const int64_t bestTilingFactor) {
+  if (!clSPIRVEnableTransformDialectJit) {
+    return failure();
+  }
+  func::FuncOp funcOp = linalgOp->getParentOfType<func::FuncOp>();
+  MLIRContext *context = funcOp.getContext();
+  auto translationInfo = IREE::Codegen::TranslationInfoAttr::get(
+      context, CodeGenPipeline::TransformDialectCodegen);
+  LLVM_DEBUG(llvm::dbgs() << "using transform dialect...\n");
+
+  gpu::GPUModel gpuModel;
+  gpuModel.subgroupSize = subgroupSize;
+  gpuModel.isSpirv = true;
+  if (failed(gpu::matchAndSetConvolutionStrategy(funcOp, linalgOp, gpuModel)))
+    return failure();
+
+  FailureOr<IREE::HAL::ExecutableExportOp> exportOp = getEntryPoint(funcOp);
+  exportOp->setSubgroupSizeAttr(Builder(context).getIndexAttr(subgroupSize));
+  return setTranslationInfo(linalgOp->getParentOfType<func::FuncOp>(),
+                            translationInfo);
+}
+
 LogicalResult setConvOpConfig(linalg::LinalgOp linalgOp,
                               const int64_t subgroupSize,
                               const int64_t bestTilingFactor) {
   assert(isa<linalg::ConvolutionOpInterface>(*linalgOp));
   LLVM_DEBUG(llvm::dbgs() << "trying to deduce config as convolution...\n");
+
+  if (succeeded(
+          setConvOpTransformConfig(linalgOp, subgroupSize, bestTilingFactor)))
+    return success();
 
   Type inputType = linalgOp.getDpsInputOperand(0)->get().getType();
   ArrayRef<int64_t> inputShape = inputType.cast<ShapedType>().getShape();

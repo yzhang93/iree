@@ -154,6 +154,26 @@ bool transform_ext::StructuredOpMatcher::match(Operation *op) {
   return true;
 }
 
+transform_ext::StructuredOpMatcher &
+transform_ext::StructuredOpMatcher::isConv2d() {
+  predicates.push_back([=](linalg::LinalgOp linalgOp) -> bool {
+    LLVM_DEBUG(DBGS() << "Checking convolution: " << linalgOp);
+    mlir::linalg::detail::ConvolutionDimensions convDims;
+    if (!linalg::detail::getMatchConvolutionMessage(
+             mlir::linalg::detail::isConvolutionInterfaceImpl(linalgOp,
+                                                              &convDims))
+             .empty())
+      return false;
+    if (linalg::isaContractionOpInterface(linalgOp) &&
+        linalgOp.getNumReductionLoops() == 2)
+      return true;
+    if (convDims.outputImage.size() != 2 || convDims.filterLoop.size() != 2)
+      return false;
+    return true;
+  });
+  return *this;
+}
+
 //===---------------------------------------------------------------------===//
 // Constraints on op rank and dims.
 //===---------------------------------------------------------------------===//
@@ -1241,8 +1261,9 @@ void transform_ext::makeConvolutionMatcher(
     MatchedConvolutionCaptures &captures) {
   // The core part of the matcher is anchored on a particular convolution op.
   auto &convolution =
-      m_StructuredOp<linalg::Conv2DNchwFchwOp, linalg::Conv2DNhwcHwcfOp, linalg::GenericOp>(
-          matcherContext)
+      m_StructuredOp<linalg::Conv2DNchwFchwOp, linalg::Conv2DNhwcHwcfOp,
+                     linalg::GenericOp>(matcherContext)
+          .isConv2d()
           // Capture convolution dim classifications.
           .convolutionDims(CaptureConvDims(captures.convolutionDims))
           // Capture op sizes.
