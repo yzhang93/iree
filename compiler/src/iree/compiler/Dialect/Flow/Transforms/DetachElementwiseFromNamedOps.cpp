@@ -39,7 +39,9 @@ struct DetachElementwisePattern
   LogicalResult matchAndRewrite(linalg::LinalgOp linalgOp,
                                 PatternRewriter &rewriter) const override {
     if (!linalg::isaContractionOpInterface(linalgOp) &&
-        !isa<linalg::ConvolutionOpInterface>(*linalgOp)) {
+        !isa<linalg::ConvolutionOpInterface>(*linalgOp)
+        && !linalg::detail::getMatchConvolutionMessage(
+            mlir::linalg::detail::isConvolutionInterfaceImpl(linalgOp)).empty()) {
       return failure();
     }
     if (!linalgOp.hasTensorSemantics()) return failure();
