@@ -26,8 +26,6 @@ using namespace mlir;
 using iree_compiler::IREE::transform_dialect::ApplyPatternsOp;
 using iree_compiler::IREE::transform_dialect::ApplyPatternsOpPatterns;
 using iree_compiler::IREE::transform_dialect::ApplyPatternsToNestedOp;
-using iree_compiler::IREE::transform_dialect::
-    ConvertConv2DToImg2ColAndAdjustWorkgroupCountOp;
 using iree_compiler::IREE::transform_dialect::ForallToWorkgroupOp;
 using iree_compiler::IREE::transform_dialect::GpuDistributeSharedMemoryCopyOp;
 using iree_compiler::IREE::transform_dialect::HoistStaticAllocOp;
@@ -35,12 +33,15 @@ using iree_compiler::IREE::transform_dialect::IREEBufferizeOp;
 using iree_compiler::IREE::transform_dialect::IREEEliminateEmptyTensorsOp;
 using iree_compiler::IREE::transform_dialect::
     IREEEraseHALDescriptorTypeFromMemRefOp;
+using iree_compiler::IREE::transform_dialect::
+    IREEPopulateWorkgroupCountRegionUsingNumThreadsSliceOp;
 using iree_compiler::IREE::transform_dialect::MapNestedForallToGpuThreadsOp;
 using iree_compiler::IREE::transform_dialect::PromoteOperandsOp;
 using iree_compiler::IREE::transform_dialect::ShareForallOperandsOp;
 using iree_compiler::IREE::transform_dialect::VectorToMMAConversionOp;
 using iree_compiler::IREE::transform_dialect::VectorToWarpExecuteOnLane0Op;
 using iree_compiler::IREE::transform_dialect::VectorWarpDistributionOp;
+using transform::ConvertConv2DToImg2ColOp;
 using transform::FuseIntoContainingOp;
 using transform::MatchOp;
 using transform::PrintOp;
@@ -384,7 +385,9 @@ void mlir::iree_compiler::gpu::buildConvolutionImplicitGemmStrategy(
   Value img2colH, matmulH;
   if (strategy.doIm2Col) {
     auto img2colWorkgroupOp =
-        b.create<ConvertConv2DToImg2ColAndAdjustWorkgroupCountOp>(convolutionH);
+        b.create<ConvertConv2DToImg2ColOp>(
+                convolutionH,
+                /*noCollapseFilter=*/false, /*noCollapseOutput=*/false);
     img2colH = img2colWorkgroupOp.getImg2colTensor();
     auto transformedH = img2colWorkgroupOp.getTransformed();
     matmulH = b.create<transform::GetProducerOfOperand>(pdlOperationType,
@@ -410,7 +413,7 @@ void mlir::iree_compiler::gpu::buildConvolutionImplicitGemmStrategy(
       buildSelectFirstNonEmpty(b, maybeTrailingH, matmulH);
   ArrayRef<Attribute> allBlocksRef(strategy.allBlockAttrs);
   TileToForallAndFuseAndDistributeResult tileResult =
-      buildTileFuseDistToForallAndWorkgroupCountWithTileSizes(
+      buildTileFuseDistToForallWithTileSizes(
           /*builder=*/b,
           /*isolatedParentOpH=*/variantH,
           /*rootH=*/fusionTargetH,
@@ -420,6 +423,10 @@ void mlir::iree_compiler::gpu::buildConvolutionImplicitGemmStrategy(
           /*threadDimMapping=*/
           b.getArrayAttr(
               allBlocksRef.take_front(strategy.workgroupTileSizes.size())));
+
+  // Handle the workgroup count region.
+  b.create<IREEPopulateWorkgroupCountRegionUsingNumThreadsSliceOp>(
+      tileResult.forallH);
 
   /// The previous fill handle gets invalidated so we match it again.
   Value newFillH =
