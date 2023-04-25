@@ -551,6 +551,10 @@ struct LinearizeTransferReadIndices final
           "cannot convert op with non-minor identity "
           "map");
     }
+    if (transferReadOp.getMask()) {
+      return rewriter.notifyMatchFailure(
+          transferReadOp, "does not support flattening masked reads");
+    }
     if (!isRankZeroOrOneMemRef(adaptor.getSource().getType())) {
       return rewriter.notifyMatchFailure(
           transferReadOp, "expected converted memref of rank <= 1");
@@ -729,6 +733,23 @@ struct RemoveDynamicCastOp final : public OpRewritePattern<memref::CastOp> {
   }
 };
 
+struct FoldConstantTransferReadMask final : public OpRewritePattern<vector::TransferReadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransferReadOp transferReadOp,
+                                PatternRewriter &rewriter) const override {
+    Value mask = transferReadOp.getMask();
+    if (!mask || !isa<vector::ConstantMaskOp>(mask.getDefiningOp()))
+      return failure();
+    rewriter.replaceOpWithNewOp<vector::TransferReadOp>(
+        transferReadOp, transferReadOp.getVectorType(), transferReadOp.getSource(),
+        transferReadOp.getIndices(), transferReadOp.getPermutationMap(),
+        transferReadOp.getPadding(), /*mask=*/Value(),
+        transferReadOp.getInBoundsAttr());
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
@@ -752,6 +773,7 @@ struct FlattenMemRefSubspanPass
     RewritePatternSet patterns(context);
     patterns.add<RemoveAssumeAlignOp>(context);
     patterns.add<RemoveDeallocOp>(context);
+    patterns.add<FoldConstantTransferReadMask>(context);
     (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
 
     RewritePatternSet flattenPatterns(context);

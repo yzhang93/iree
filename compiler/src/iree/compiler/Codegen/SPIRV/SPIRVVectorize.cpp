@@ -285,6 +285,24 @@ bool supportsIntegerDotProductOps(func::FuncOp fn) {
   return true;
 }
 
+/// Pattern to drop masking on transfer_read ops
+struct FoldConstantTransferReadMask final : public OpRewritePattern<vector::TransferReadOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(vector::TransferReadOp transferReadOp,
+                                PatternRewriter &rewriter) const override {
+    Value mask = transferReadOp.getMask();
+    if (!mask || !isa<vector::ConstantMaskOp>(mask.getDefiningOp()))
+      return failure();
+    rewriter.replaceOpWithNewOp<vector::TransferReadOp>(
+        transferReadOp, transferReadOp.getVectorType(), transferReadOp.getSource(),
+        transferReadOp.getIndices(), transferReadOp.getPermutationMap(),
+        transferReadOp.getPadding(), /*mask=*/Value(),
+        transferReadOp.getInBoundsAttr());
+    return success();
+  }
+};
+
 /// Vectorizes Linalg ops on buffer semantics.
 class SPIRVVectorizePass : public SPIRVVectorizeBase<SPIRVVectorizePass> {
  public:
@@ -335,6 +353,7 @@ class SPIRVVectorizePass : public SPIRVVectorizeBase<SPIRVVectorizePass> {
       vector::ContractionOp::getCanonicalizationPatterns(patterns, context);
       // Fold transpose ops if possible as we cannot unroll it later.
       vector::TransposeOp::getCanonicalizationPatterns(patterns, context);
+      patterns.add<FoldConstantTransferReadMask>(context);
 
       if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
         return signalPassFailure();
