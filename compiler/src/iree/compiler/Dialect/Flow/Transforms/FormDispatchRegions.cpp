@@ -575,6 +575,14 @@ static bool isFusableWithProducer(
   Operation *producer = operand.get().getDefiningOp();
   Operation *consumer = operand.getOwner();
 
+  if (isa<linalg::GenericOp>(producer) && isa<linalg::GenericOp>(consumer)) {
+    auto convOp = cast<linalg::LinalgOp>(consumer);
+    linalg::detail::ConvolutionDimensions convDims;
+    auto errString = getMatchConvolutionMessage(
+    linalg::detail::isConvolutionInterfaceImpl(convOp, &convDims));
+    if (errString.empty()) return true;
+  }
+
   if (auto padOp = dyn_cast<tensor::PadOp>(consumer)) {
     if (options.fusePadWithProducers || isPadUsedInSetEncoding(padOp)) {
       return isa<linalg::LinalgOp>(producer);

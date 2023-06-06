@@ -62,6 +62,17 @@ static std::optional<OpOperand *> getFusableUse(Operation *op,
 /// Check if the producer generic op is fusable with the consumer generic op.
 static bool areFusableOps(MLIRContext *context, Operation *producerOp,
                           Operation *consumerOp) {
+
+  // Don't fuse if the consumer is convolution in generic form.
+  if (isa<linalg::GenericOp>(producerOp) && isa<linalg::GenericOp>(consumerOp)) {
+    auto convOp = cast<linalg::LinalgOp>(consumerOp);
+    linalg::detail::ConvolutionDimensions convDims;
+    auto errString = getMatchConvolutionMessage(
+    linalg::detail::isConvolutionInterfaceImpl(convOp, &convDims));
+    if (errString.empty()) return false;
+    return false;
+  }
+
   // Check for i1 return types, if so aggressively fuse to avoid `i1` buffers.
   if (llvm::all_of(producerOp->getResultTypes(), [](Type t) {
         if (t.isInteger(1)) return true;
@@ -78,6 +89,13 @@ static bool areFusableOps(MLIRContext *context, Operation *producerOp,
     if (!llvm::all_of(
             linalgConsumerOp.getIndexingMapsArray(),
             [](AffineMap map) { return map.isProjectedPermutation(); })) {
+      return false;
+    }
+  }
+
+  // Don't fuse if the consumer is contraction op.
+  if (auto linalgConsumerOp = dyn_cast<linalg::LinalgOp>(consumerOp)) {
+    if (linalg::isaContractionOpInterface(linalgConsumerOp)) {
       return false;
     }
   }

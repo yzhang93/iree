@@ -1306,6 +1306,7 @@ void transform_ext::makeConvolutionMatcher(
     transform_ext::StructuredOpMatcher *&convolutionCapture,
     transform_ext::PadOpMatcher *&padCapture,
     transform_ext::StructuredOpMatcher *&fillCapture,
+    transform_ext::StructuredOpMatcher *&dequantizeCapture,
     transform_ext::StructuredOpMatcher *&trailingCapture,
     MatchedConvolutionCaptures &captures) {
   // The core part of the matcher is anchored on a particular convolution op.
@@ -1335,6 +1336,23 @@ void transform_ext::makeConvolutionMatcher(
                   .padDims(AllDims(), CaptureDims(captures.padOpSizes));
   convolution = convolution.input(0, pad, OptionalMatch());
   padCapture = &pad;
+
+  // Optional dequantize op
+  auto &dequantize =
+      m_StructuredOp<linalg::GenericOp>(matcherContext)
+          // All parallel dimensions.
+          .dim(AllDims(), utils::IteratorType::parallel)
+          // All inputs are any projected permutation.
+          .input(AllOperands(), IsProjectedPermutation())
+          .output(AllOperands(), IsIdentity())
+          .output(NumEqualsTo(1))
+          .dim(AllDims(), CaptureDims(captures.dequantizeOpSizes))
+          // Capture output elemental type.
+          .output(0, CaptureElementTypeBitWidth(
+                         captures.maybeDequantizeOutputElementalTypeBitWidth));
+
+  convolution = convolution.input(1, dequantize, OptionalMatch());
+  dequantizeCapture = &dequantize;
 
   // Optional trailing op can be any map, transpose, broadcast but
   // not reduce or windowing operation for now.
@@ -1366,6 +1384,7 @@ void transform_ext::makeConvolutionMatcher(
   PadOpMatcher *pad;
   StructuredOpMatcher *fill;
   StructuredOpMatcher *trailing;
-  makeConvolutionMatcher(context, convolutionCapture, pad, fill, trailing,
+  StructuredOpMatcher *dequantize;
+  makeConvolutionMatcher(context, convolutionCapture, pad, fill, dequantize, trailing,
                          captures);
 }

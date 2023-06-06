@@ -839,15 +839,17 @@ struct MatchedConvolutionCaptures {
   mlir::linalg::detail::ConvolutionDimensions convolutionDims = {};
   SmallVector<int64_t> convolutionOpSizes = {};
   SmallVector<int64_t> trailingOpSizes = {};
+  SmallVector<int64_t> dequantizeOpSizes = {};
   SmallVector<int64_t> padOpSizes = {};
   int64_t convolutionOutputElementalTypeBitWidth = 0;
   int64_t maybeTrailingOutputElementalTypeBitWidth = 0;
+  int64_t maybeDequantizeOutputElementalTypeBitWidth = 0;
   int64_t maybeFillElementalTypeBitWidth = 0;
 };
 
 /// Creates a group of matchers for:
 ///
-///     trailing(convolution(input, filter, fill()))
+///     trailing(convolution(input, dequantize(filter), fill()))
 ///
 /// where fill is a FillOp and trailing is an elementwise operation, both of
 /// which is optional. Each matcher will capture the corresponding operation.
@@ -855,6 +857,7 @@ void makeConvolutionMatcher(transform_ext::MatcherContext &context,
                             StructuredOpMatcher *&convolutionCapture,
                             PadOpMatcher *&padCapture,
                             StructuredOpMatcher *&fillCapture,
+                            StructuredOpMatcher *&dequantizeCapture,
                             StructuredOpMatcher *&trailingCapture,
                             MatchedConvolutionCaptures &captures);
 void makeConvolutionMatcher(transform_ext::MatcherContext &context,

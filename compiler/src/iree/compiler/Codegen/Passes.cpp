@@ -93,7 +93,7 @@ void addCommonTargetExecutablePreprocessingPasses(
   passManager.addNestedPass<func::FuncOp>(
       IREE::LinalgExt::createDecomposeSoftmaxPass());
   // Temporary solution to avoid large allocations due to softmax lowering.
-  passManager.addNestedPass<func::FuncOp>(createRematerializeParallelOpsPass());
+  //passManager.addNestedPass<func::FuncOp>(createRematerializeParallelOpsPass());
 }
 
 }  // namespace iree_compiler

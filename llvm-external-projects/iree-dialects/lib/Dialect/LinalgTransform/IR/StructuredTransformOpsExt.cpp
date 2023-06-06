@@ -683,10 +683,10 @@ convolutionCallback(transform_ext::MatchCallbackResult &res, Location loc,
   }
 
   transform_ext::PadOpMatcher *pad;
-  transform_ext::StructuredOpMatcher *pattern, *fill, *trailing;
+  transform_ext::StructuredOpMatcher *pattern, *fill, *dequantize, *trailing;
   transform_ext::MatchedConvolutionCaptures ignore;
   transform_ext::MatcherContext matcherContext;
-  makeConvolutionMatcher(matcherContext, pattern, pad, fill, trailing, ignore);
+  makeConvolutionMatcher(matcherContext, pattern, pad, fill, dequantize, trailing, ignore);
 
   // TODO: need a mechanism for this to go around the entire IR,
   // potentially with list matches for each group.
@@ -714,6 +714,7 @@ convolutionCallback(transform_ext::MatchCallbackResult &res, Location loc,
     res.addPotentiallyEmptyPayloadGroup(pad->getCaptured());
     res.addPotentiallyEmptyPayloadGroup(fill->getCaptured());
     res.addPayloadGroup({pattern->getCaptured()});
+    res.addPotentiallyEmptyPayloadGroup(dequantize->getCaptured());
     res.addPotentiallyEmptyPayloadGroup(trailing->getCaptured());
     return WalkResult::interrupt();
   });
