@@ -263,6 +263,8 @@ static LogicalResult serializeGenericElementData(
     // element type is not integer or floating-point.
     int32_t bitwidth = attr.getType().getElementTypeBitWidth();
     switch (bitwidth) {
+      case 4:
+        return serializeRawData(attr, os);
       case 8:
         return serializeRawData(attr, os);
       case 16:

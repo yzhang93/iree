@@ -154,6 +154,12 @@ def ExtractAddressComputationGPU: Pass<"extract-address-computation-gpu"> {
   ];
 }
 
+def EmulateNarrowType :
+    Pass<"iree-emulate-narrow-type", "ModuleOp"> {
+  let summary = "Emulate narrow integer operations using wide integer operations";
+  let constructor = "mlir::iree_compiler::createEmulateNarrowTypePass()";
+}
+
 def FlattenMemRefSubspan :
   Pass<"iree-codegen-flatten-memref-subspan", "ModuleOp"> {
   let summary =

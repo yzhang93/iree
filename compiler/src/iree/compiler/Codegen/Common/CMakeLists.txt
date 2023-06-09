@@ -96,6 +96,7 @@ iree_cc_library(
     "ConvertToDestinationPassingStylePass.cpp"
     "DecomposeAffineOpsPass.cpp"
     "DecomposePackUnPackOps.cpp"
+    "EmulateNarrowType.cpp"
     "EraseHALDescriptorTypeFromMemRef.cpp"
     "FlattenMemRefSubspanPass.cpp"
     "FoldTensorExtractOpPass.cpp"

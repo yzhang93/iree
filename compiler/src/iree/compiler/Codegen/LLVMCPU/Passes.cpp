@@ -665,6 +665,8 @@ static void addLowerToLLVMPasses(OpPassManager &passManager) {
   if (clCheckIRBeforeLLVMConversion) {
     passManager.addPass(createLLVMCPUCheckIRBeforeLLVMConversionPass());
   }
+  passManager.addNestedPass<func::FuncOp>(
+      memref::createFoldMemRefAliasOpsPass());
 
   // SCF -> CF
   passManager.addNestedPass<func::FuncOp>(createConvertSCFToCFPass());
@@ -674,6 +676,10 @@ static void addLowerToLLVMPasses(OpPassManager &passManager) {
   // (HAL, IREE, Linalg, CF) -> LLVM
   passManager.addNestedPass<func::FuncOp>(arith::createArithExpandOpsPass());
   passManager.addNestedPass<func::FuncOp>(memref::createExpandOpsPass());
+  passManager.addPass(createEmulateNarrowTypePass());
+  passManager.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+  passManager.addNestedPass<func::FuncOp>(createCSEPass());
+
   if (clInstrumentMemoryAccesses) {
     passManager.addNestedPass<func::FuncOp>(
         createInstrumentMemoryAccessesPass());
