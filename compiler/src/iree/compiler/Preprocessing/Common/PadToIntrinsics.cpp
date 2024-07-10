@@ -174,7 +174,17 @@ static void padConvOp(RewriterBase &rewriter, linalg::LinalgOp linalgOp) {
     return;
 
   // Early exit if cannot find intrinsics or if multiple executable targets.
-  SmallVector<GPUMatmulShapeType> intrinsics = getIntrinsics(linalgOp);
+  //SmallVector<GPUMatmulShapeType> intrinsics = getIntrinsics(linalgOp);
+  Value lhs = linalgOp.getDpsInputOperand(0)->get();
+  Value rhs = linalgOp.getDpsInputOperand(1)->get();
+  Value out = linalgOp.getDpsInitOperand(0)->get();
+  auto outType = llvm::cast<ShapedType>(out.getType());
+  Type lhsElemType = llvm::cast<ShapedType>(lhs.getType()).getElementType();
+  Type rhsElemType = llvm::cast<ShapedType>(rhs.getType()).getElementType();
+  Type outElemType = outType.getElementType();
+  auto gpuType = GPUMatmulShapeType{4, 4, 8, lhsElemType, rhsElemType, outElemType};
+  SmallVector<GPUMatmulShapeType> intrinsics = {gpuType};
+
   if (intrinsics.empty())
     return;
 
@@ -184,23 +194,24 @@ static void padConvOp(RewriterBase &rewriter, linalg::LinalgOp linalgOp) {
       mlir::linalg::inferConvolutionDims(linalgOp);
   assert(succeeded(convolutionDims) && "Could not infer contraction dims");
 
-  if (convolutionDims->outputChannel.size() != 1 ||
-      convolutionDims->inputChannel.size() != 1 ||
-      convolutionDims->filterLoop.size() < 1 ||
-      convolutionDims->outputImage.size() < 1 ||
-      convolutionDims->depth.size() != 0) {
-    return;
-  }
+  // if (convolutionDims->outputChannel.size() != 1 ||
+  //     convolutionDims->inputChannel.size() != 1 ||
+  //     convolutionDims->filterLoop.size() < 1 ||
+  //     convolutionDims->outputImage.size() < 1 ||
+  //     convolutionDims->depth.size() != 0) {
+  //   return;
+  // }
 
-  auto isAllOnesList = [](ArrayRef<int64_t> list) {
-    return llvm::all_of(list, [](int64_t i) { return i == 1; });
-  };
+  // auto isAllOnesList = [](ArrayRef<int64_t> list) {
+  //   return llvm::all_of(list, [](int64_t i) { return i == 1; });
+  // };
 
   // TODO: Support non-unit strides/dilations.
-  if (!isAllOnesList(convolutionDims->strides) ||
-      !isAllOnesList(convolutionDims->dilations)) {
-    return;
-  }
+  // if (!isAllOnesList(convolutionDims->strides) ||
+  //     !isAllOnesList(convolutionDims->dilations)) {
+  //   llvm::outs() << "here!!" << "\n";
+  //   return;
+  // }
 
   int64_t mDim = convolutionDims->outputImage.back();
   int64_t nDim = convolutionDims->outputChannel.front();
