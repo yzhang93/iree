@@ -165,6 +165,21 @@ getIntrinsics(linalg::LinalgOp linalgOp) {
   });
 }
 
+/// Struct containing information about a matmul's shape and type.
+struct AIEMatmulShapeType {
+  int64_t pSize; // number of AIE cores for distribution
+  int64_t mSize;
+  int64_t nSize;
+  int64_t kSize;
+  Type aType;
+  Type bType;
+  Type cType;
+
+  AIEMatmulShapeType(int64_t p, int64_t m, int64_t n, int64_t k, Type a, Type b,
+                     Type c)
+      : pSize(p), mSize(m), nSize(n), kSize(k), aType(a), bType(b), cType(c) {}
+};
+
 static void padConvOp(RewriterBase &rewriter, linalg::LinalgOp linalgOp) {
   if (!isa<linalg::ConvolutionOpInterface>(*linalgOp)) {
     return;
@@ -182,8 +197,9 @@ static void padConvOp(RewriterBase &rewriter, linalg::LinalgOp linalgOp) {
   Type lhsElemType = llvm::cast<ShapedType>(lhs.getType()).getElementType();
   Type rhsElemType = llvm::cast<ShapedType>(rhs.getType()).getElementType();
   Type outElemType = outType.getElementType();
-  auto gpuType = GPUMatmulShapeType{4, 4, 8, lhsElemType, rhsElemType, outElemType};
-  SmallVector<GPUMatmulShapeType> intrinsics = {gpuType};
+  auto aieIntrin =
+      AIEMatmulShapeType{4, 4, 4, 8, lhsElemType, rhsElemType, outElemType};
+  SmallVector<AIEMatmulShapeType> intrinsics = {aieIntrin};
 
   if (intrinsics.empty())
     return;
@@ -194,24 +210,23 @@ static void padConvOp(RewriterBase &rewriter, linalg::LinalgOp linalgOp) {
       mlir::linalg::inferConvolutionDims(linalgOp);
   assert(succeeded(convolutionDims) && "Could not infer contraction dims");
 
-  // if (convolutionDims->outputChannel.size() != 1 ||
-  //     convolutionDims->inputChannel.size() != 1 ||
-  //     convolutionDims->filterLoop.size() < 1 ||
-  //     convolutionDims->outputImage.size() < 1 ||
-  //     convolutionDims->depth.size() != 0) {
-  //   return;
-  // }
+  if (convolutionDims->outputChannel.size() != 1 ||
+      convolutionDims->inputChannel.size() != 1 ||
+      convolutionDims->filterLoop.size() < 1 ||
+      convolutionDims->outputImage.size() < 1 ||
+      convolutionDims->depth.size() != 0) {
+    return;
+  }
 
-  // auto isAllOnesList = [](ArrayRef<int64_t> list) {
-  //   return llvm::all_of(list, [](int64_t i) { return i == 1; });
-  // };
+  auto isAllOnesList = [](ArrayRef<int64_t> list) {
+    return llvm::all_of(list, [](int64_t i) { return i == 1; });
+  };
 
   // TODO: Support non-unit strides/dilations.
-  // if (!isAllOnesList(convolutionDims->strides) ||
-  //     !isAllOnesList(convolutionDims->dilations)) {
-  //   llvm::outs() << "here!!" << "\n";
-  //   return;
-  // }
+  if (!isAllOnesList(convolutionDims->strides) ||
+      !isAllOnesList(convolutionDims->dilations)) {
+    return;
+  }
 
   int64_t mDim = convolutionDims->outputImage.back();
   int64_t nDim = convolutionDims->outputChannel.front();
@@ -221,15 +236,17 @@ static void padConvOp(RewriterBase &rewriter, linalg::LinalgOp linalgOp) {
     return;
   }
   int64_t kDim = convolutionDims->inputChannel.front();
+  int64_t pDim = convolutionDims->outputImage.front();
   int64_t mSize = bounds[mDim];
   int64_t nSize = bounds[nDim];
   int64_t kSize = bounds[kDim];
+  int64_t pSize = bounds[pDim];
 
   // TODO: Generalize to other dimensions.
   // Try to search for pad value and check only filter dimension is blocked.
-  SmallVector<std::array<int64_t, 3>> mnkPaddingCandidates;
-  for (const GPUMatmulShapeType &intrinsic : intrinsics) {
-    std::optional<int64_t> mPadding, nPadding, kPadding;
+  SmallVector<std::array<int64_t, 4>> mnkPaddingCandidates;
+  for (const AIEMatmulShapeType &intrinsic : intrinsics) {
+    std::optional<int64_t> mPadding, nPadding, kPadding, pPadding;
     auto getPadding = [](int64_t value, int64_t padTo) {
       return llvm::divideCeil(value, padTo) * padTo - value;
     };
@@ -246,18 +263,24 @@ static void padConvOp(RewriterBase &rewriter, linalg::LinalgOp linalgOp) {
       kPadding = getPadding(kSize, intrinsic.kSize);
     }
 
-    if (!mPadding && !nPadding && !kPadding) {
+    if (pSize % intrinsic.pSize != 0) {
+      pPadding = getPadding(pSize, intrinsic.pSize);
+    }
+
+    if (!pPadding && !mPadding && !nPadding && !kPadding) {
       // Some intrinsic matches. Nothing to do.
       return;
     }
-    mnkPaddingCandidates.push_back(
-        {mPadding.value_or(0), nPadding.value_or(0), kPadding.value_or(0)});
+    mnkPaddingCandidates.push_back({mPadding.value_or(0), nPadding.value_or(0),
+                                    kPadding.value_or(0),
+                                    pPadding.value_or(0)});
   }
+
   if (mnkPaddingCandidates.empty()) {
     return;
   }
 
-  std::array<int64_t, 3> mnkPadding = mnkPaddingCandidates.front();
+  std::array<int64_t, 4> mnkPadding = mnkPaddingCandidates.front();
 
   Value newInput = linalgOp.getDpsInputOperand(0)->get();
   Value newFilter = linalgOp.getDpsInputOperand(1)->get();
@@ -267,11 +290,12 @@ static void padConvOp(RewriterBase &rewriter, linalg::LinalgOp linalgOp) {
   OpFoldResult mPadding = rewriter.getIndexAttr(mnkPadding[0]);
   OpFoldResult nPadding = rewriter.getIndexAttr(mnkPadding[1]);
   OpFoldResult kPadding = rewriter.getIndexAttr(mnkPadding[2]);
+  OpFoldResult pPadding = rewriter.getIndexAttr(mnkPadding[3]);
   OpFoldResult zero = rewriter.getIndexAttr(0);
   if (!isConstantIntValue(mPadding, 0) || !isConstantIntValue(kPadding, 0)) {
     // For NHWC, the m-padding is for W and k-padding is for C
     newInput = getPaddedValue(rewriter, loc, newInput,
-                              {zero, zero, mPadding, kPadding});
+                              {zero, pPadding, mPadding, kPadding});
   }
   if (!isConstantIntValue(nPadding, 0) || !isConstantIntValue(kPadding, 0)) {
     // For HWCF, the n-padding is for F and k-padding is for C
@@ -279,9 +303,9 @@ static void padConvOp(RewriterBase &rewriter, linalg::LinalgOp linalgOp) {
                                {zero, zero, kPadding, nPadding});
   }
   if (!isConstantIntValue(mPadding, 0) || !isConstantIntValue(nPadding, 0)) {
-    // For output, the m-padding is for W and k-padding is for F
+    // For output, the m-padding is for W and n-padding is for F
     newOuts = getPaddedValue(rewriter, loc, newOuts,
-                             {zero, zero, mPadding, nPadding});
+                             {zero, pPadding, mPadding, nPadding});
   }
 
   linalg::LinalgOp paddedConv2dOp =
