@@ -582,6 +582,7 @@ getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
       filterDims.push_back(dims[currKPos++]);
     }
   }
+  std::iter_swap(filterDims.begin(),filterDims.begin()+1);
   auto filterMapGEMM =
       AffineMap::get(numParallelDims + numKDims, 0, filterDims, ctx);
 

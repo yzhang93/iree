@@ -225,10 +225,19 @@ public:
     Value reshapedFilter = rewriter.create<tensor::CollapseShapeOp>(
         loc, filter, filterReassocIndices);
 
+    auto type = cast<ShapedType>(reshapedFilter.getType());
+    ArrayRef<int64_t> shape = type.getShape();
+    SmallVector<Value> dynamicDims;
+    Value empty = rewriter.create<tensor::EmptyOp>(
+      loc, ArrayRef<int64_t>{shape[1], shape[0]}, type.getElementType(),
+      dynamicDims);
+    Value transposeOp = rewriter.create<linalg::TransposeOp>(
+      loc, reshapedFilter, empty, ArrayRef<int64_t>{1, 0})->getResult(0);
+
     auto genericGEMMOp = rewriter.create<linalg::GenericOp>(
         loc, outputType,
         /*inputs=*/
-        isOutputChannelFirst ? ValueRange{reshapedFilter, img2ColTensor}
+        isOutputChannelFirst ? ValueRange{transposeOp, img2ColTensor}
                              : ValueRange{img2ColTensor, reshapedFilter},
         /*outputs=*/ValueRange{output}, igemmContractionMaps,
         igemmLoopIterators,
