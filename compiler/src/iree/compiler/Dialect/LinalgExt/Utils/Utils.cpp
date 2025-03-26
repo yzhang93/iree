@@ -587,13 +587,13 @@ getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
       AffineMap::get(numParallelDims + numKDims, 0, filterDims, ctx);
 
   SmallVector<AffineMap> indexingGEMMMaps;
-  if (isOutputChannelFirst) {
-    indexingGEMMMaps.push_back(filterMapGEMM);
-    indexingGEMMMaps.push_back(inputMapGEMM);
-  } else {
-    indexingGEMMMaps.push_back(inputMapGEMM);
-    indexingGEMMMaps.push_back(filterMapGEMM);
-  }
+  // if (isOutputChannelFirst) {
+  //   indexingGEMMMaps.push_back(filterMapGEMM);
+  //   indexingGEMMMaps.push_back(inputMapGEMM);
+  // } else {
+  indexingGEMMMaps.push_back(inputMapGEMM);
+  indexingGEMMMaps.push_back(filterMapGEMM);
+  // }
   indexingGEMMMaps.push_back(resultMap);
   IGEMMGenericConvDetails igemmDetails;
   igemmDetails.igemmContractionMaps = indexingGEMMMaps;

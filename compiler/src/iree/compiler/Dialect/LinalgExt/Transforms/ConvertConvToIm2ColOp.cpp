@@ -125,7 +125,7 @@ public:
     mlir::linalg::ConvolutionDimensions convDims = igemmConvDetails.convDims;
     SmallVector<ReassociationIndices> filterReassocIndices =
         igemmConvDetails.filterReassocIndices;
-    bool isOutputChannelFirst = igemmConvDetails.isOutputChannelFirst;
+    //bool isOutputChannelFirst = igemmConvDetails.isOutputChannelFirst;
     SmallVector<int64_t> igemmLoopBounds = igemmConvDetails.igemmLoopBounds;
     SmallVector<utils::IteratorType> igemmLoopIterators =
         igemmConvDetails.igemmLoopIterators;
@@ -237,17 +237,17 @@ public:
     auto genericGEMMOp = rewriter.create<linalg::GenericOp>(
         loc, outputType,
         /*inputs=*/
-        isOutputChannelFirst ? ValueRange{transposeOp, img2ColTensor}
-                             : ValueRange{img2ColTensor, reshapedFilter},
+        // isOutputChannelFirst ? ValueRange{reshapedFilter, img2ColTensor}
+                             ValueRange{img2ColTensor, transposeOp},
         /*outputs=*/ValueRange{output}, igemmContractionMaps,
         igemmLoopIterators,
         [](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-          Value lhs = convertScalarToDtype(nestedBuilder, nestedLoc, args[0],
+          Value lhs = convertScalarToDtype(nestedBuilder, nestedLoc, args[1],
                                            args[2].getType(),
                                            /*isUnsignedCast=*/false);
-          Value rhs = convertScalarToDtype(nestedBuilder, nestedLoc, args[1],
-                                           args[2].getType(),
-                                           /*isUnsignedCast=*/false);
+          Value rhs = convertScalarToDtype(nestedBuilder, nestedLoc, args[0],
+                                            args[2].getType(),
+                                            /*isUnsignedCast=*/false);
           Value mul = createMul(nestedLoc, lhs, rhs, nestedBuilder);
           Value add = createAdd(nestedLoc, mul, args[2], nestedBuilder);
           nestedBuilder.create<linalg::YieldOp>(nestedLoc, add);
