@@ -58,6 +58,34 @@ static LogicalResult decomposeIm2col(Im2colOp im2colOp, RewriterBase &rewriter,
   return success();
 }
 
+struct FuseTilableSliceProducers final
+    : OpRewritePattern<tensor::ExtractSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(tensor::ExtractSliceOp sliceOp,
+                                PatternRewriter &rewriter) const override {
+    if (sliceOp->use_empty()) {
+      return failure();
+    }
+    auto tilableProducer = sliceOp.getSource().getDefiningOp<TilingInterface>();
+    if (!tilableProducer) {
+      return failure();
+    }
+
+    auto parentFor = sliceOp->getParentOfType<scf::ForOp>();
+    if (!parentFor) {
+      return failure();
+    }
+
+    SmallVector<LoopLikeOpInterface> loops = {parentFor};
+    std::optional<scf::SCFFuseProducerOfSliceResult> fusionResult =
+        mlir::scf::tileAndFuseProducerOfSlice(rewriter, sliceOp, loops);
+    if (!fusionResult) {
+      return failure();
+    }
+    return success();
+  }
+};
+
 namespace {
 struct DecomposeIm2colPass final
     : impl::DecomposeIm2colPassBase<DecomposeIm2colPass> {
@@ -89,6 +117,8 @@ void DecomposeIm2colPass::runOnOperation() {
 
   RewritePatternSet patterns(context);
   memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
+  tensor::populateFoldTensorEmptyPatterns(patterns);
+  patterns.insert<FuseTilableSliceProducers>(context);
   // After im2col is decomposed, im2col extract slice can be swapped with input
   // padding.
   patterns.insert<linalg::ExtractSliceOfPadTensorSwapPattern>(
