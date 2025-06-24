@@ -14,6 +14,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 
 namespace mlir::iree_compiler::IREE::GPU {
 
@@ -105,8 +106,26 @@ static SmallVector<int64_t> getVectorTileSizesFromLoopRanges(
   return tileSizes;
 }
 
+FailureOr<IREE::LinalgExt::Im2colOp> isIm2colInDefChain(Value operand) {
+  Operation *defOp = operand.getDefiningOp();
+  if (!defOp) return failure();
+
+  if (isa<IREE::LinalgExt::Im2colOp>(defOp)) 
+    return dyn_cast<IREE::LinalgExt::Im2colOp>(defOp);
+
+  if (!isa<tensor::PadOp>(defOp) || isa<tensor::ExtractSliceOp>(defOp)) {
+    return failure();
+  }
+
+  for (Value operand : defOp->getOperands()) {
+    return isIm2colInDefChain(operand);
+  }
+  return failure();
+}
+
 SmallVector<int64_t> deriveLinalgOpThreadTileSizes(linalg::LinalgOp linalgOp,
                                                    int64_t numThreads) {
+
   if (!linalgOp.hasPureTensorSemantics()) {
     return {};
   }
@@ -114,8 +133,24 @@ SmallVector<int64_t> deriveLinalgOpThreadTileSizes(linalg::LinalgOp linalgOp,
   int64_t vectorSize = kPreferredCopyNumBits /
                        getElementTypeOrSelf(linalgOp->getResultTypes()[0])
                            .getIntOrFloatBitWidth();
+  
+  bool allowMultiDimCollapse = true;
+  bool vectorizeOutermost = false;
+  for (Value operand : linalgOp->getOperands()) {
+    auto maybeIm2col = isIm2colInDefChain(operand);
+    if (!failed(maybeIm2col)) {
+      auto im2colOp = maybeIm2col.value();
+      unsigned innerDim = im2colOp.getInputRank() - 1;
+      vectorizeOutermost = im2colOp.getBatchPos().size() == 1 &&
+                           im2colOp.getBatchPos().back() == innerDim;
+      allowMultiDimCollapse = false;
+      break;
+    }
+  }
+
   SmallVector<int64_t> tileSizes =
-      getVectorTileSizesFromLoopRanges(loopRanges, numThreads, vectorSize);
+      getVectorTileSizesFromLoopRanges(loopRanges, numThreads, vectorSize, allowMultiDimCollapse, vectorizeOutermost);
+
   for (auto [tileSize, iterType] :
        llvm::zip(tileSizes, linalgOp.getIteratorTypesArray())) {
     if (iterType == utils::IteratorType::reduction) {
