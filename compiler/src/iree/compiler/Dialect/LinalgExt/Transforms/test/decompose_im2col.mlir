@@ -242,34 +242,6 @@ module {
 // -----
 
 module {
-  func.func @im2col_padding(%input: tensor<1x8x3x3xf32>) -> tensor<1x2x2x12xf32> {
-    %cst = arith.constant 0.000000e+00 : f32
-    %empty = tensor.empty() : tensor<1x2x2x12xf32>
-    %padded = tensor.pad %input low[0, 0, 3, 3] high[0, 0, 3, 3] {
-  ^bb0(%arg0: index, %arg1: index, %arg2: index, %arg3: index):
-    tensor.yield %cst : f32
-  } : tensor<1x8x3x3xf32> to tensor<1x8x9x9xf32>
-  %im2col = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
-                              m_offset = [0, 0] * [2, 1] k_offset = [0] * [1]
-                              batch_pos = [0] m_pos = [2, 3] k_pos = [1]
-                              input_k_perm = [0, 1, 2]
-                              ins(%padded : tensor<1x8x9x9xf32>)
-                              outs(%empty : tensor<1x2x2x12xf32>) -> tensor<1x2x2x12xf32>
-  return %im2col : tensor<1x2x2x12xf32>
-  }
-}
-
-// CHECK-LABEL: func.func @im2col_padding
-//  CHECK-SAME:     %[[ARG0:[a-zA-Z0-9_]+]]
-//       CHECK: %[[T1:.+]] = tensor.extract_slice %[[ARG0]]
-//       CHECK: %[[T2:.+]] = tensor.pad %[[T1]]
-//  CHECK-NEXT: ^bb0
-//  CHECK-NEXT:   tensor.yield
-//  CHECK-NEXT: } : tensor<1x1x?x?xf32> to tensor<1x1x1x1xf32>
-
-// -----
-
-module {
   func.func @im2col_nhc_with_perm(%arg0: tensor<1x3x2xf32>) -> tensor<1x2x4xf32> {
     %0 = tensor.empty() : tensor<1x2x4xf32>
     %1 = iree_linalg_ext.im2col strides = [1] dilations = [1] kernel_size = [2]
@@ -410,3 +382,74 @@ module {
 //       CHECK:     %[[OUT_SLICE:.+]] = tensor.extract_slice {{.*}} : tensor<4x?x?xf32> to tensor<4xf32>
 //       CHECK:     %[[COPY:.+]] = linalg.copy ins(%[[IN_SLICE]] : tensor<4xf32>) outs(%[[OUT_SLICE]] : tensor<4xf32>)
 //       CHECK:     %[[INSERT:.+]] = tensor.insert_slice %[[COPY]] into {{.*}} : tensor<4xf32> into tensor<4x?x?xf32>
+
+// -----
+
+module {
+  func.func @im2col_pre_padding(%input: tensor<1x8x3x3xf32>) -> tensor<1x2x2x12xf32> {
+    %cst = arith.constant 0.000000e+00 : f32
+    %empty = tensor.empty() : tensor<1x2x2x12xf32>
+    %padded = tensor.pad %input low[0, 0, 3, 3] high[0, 0, 3, 3] {
+    ^bb0(%arg0: index, %arg1: index, %arg2: index, %arg3: index):
+      tensor.yield %cst : f32
+    } : tensor<1x8x3x3xf32> to tensor<1x8x9x9xf32>
+    %im2col = iree_linalg_ext.im2col strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
+                                m_offset = [0, 0] * [2, 1] k_offset = [0] * [1]
+                                batch_pos = [0] m_pos = [2, 3] k_pos = [1]
+                                input_k_perm = [0, 1, 2]
+                                ins(%padded : tensor<1x8x9x9xf32>)
+                                outs(%empty : tensor<1x2x2x12xf32>) -> tensor<1x2x2x12xf32>
+    return %im2col : tensor<1x2x2x12xf32>
+  }
+}
+
+// CHECK-LABEL: func.func @im2col_pre_padding
+//  CHECK-SAME:     %[[ARG0:[a-zA-Z0-9_]+]]
+//       CHECK: %[[T1:.+]] = tensor.extract_slice %[[ARG0]]
+//       CHECK: %[[T2:.+]] = tensor.pad %[[T1]]
+//  CHECK-NEXT: ^bb0
+//  CHECK-NEXT:   tensor.yield
+//  CHECK-NEXT: } : tensor<1x1x?x?xf32> to tensor<1x1x1x1xf32>
+
+// -----
+
+#map = affine_map<(d0) -> (-d0 + 8)>
+module {
+  func.func @im2col_chwn_post_padding(%arg0: tensor<16x194x130x?xbf16>, %arg1: tensor<?x2x2x1xbf16>, %arg2: index) -> tensor<8x2x2x1xbf16> {
+    %cst = arith.constant 0.000000e+00 : bf16
+    %0 = affine.apply #map(%arg2)
+    %1 = iree_linalg_ext.im2col 
+            strides = [1, 1] dilations = [2, 2] kernel_size = [96, 64] 
+            m_offset = [0, 0] * [3, 1] k_offset = [0] * [1] 
+            batch_pos = [3] m_pos = [1, 2] k_pos = [0] input_k_perm = [0, 1, 2] 
+            ins(%arg0 : tensor<16x194x130x?xbf16>) 
+            outs(%arg1 : tensor<?x2x2x1xbf16>) -> tensor<?x2x2x1xbf16>
+    %padded = tensor.pad %1 low[0, 0, 0, 0] high[%0, 0, 0, 0] {
+    ^bb0(%arg3: index, %arg4: index, %arg5: index, %arg6: index):
+      tensor.yield %cst : bf16
+    } : tensor<?x2x2x1xbf16> to tensor<8x2x2x1xbf16>
+    return %padded : tensor<8x2x2x1xbf16>
+  }
+}
+
+//   CHECK-DAG: #[[$MAP:.+]] = affine_map<()[s0] -> (-s0 + 8)>
+//   CHECK-DAG: #[[$MAP1:.+]] = affine_map<(d0, d1) -> (d0 * 3 + d1)>
+//   CHECK-DAG: #[[$MAP2:.+]] = affine_map<()[s0] -> (8, s0)>
+// CHECK-LABEL: func.func @im2col_chwn_post_padding
+//  CHECK-SAME: %[[ARG2:[a-zA-Z0-9_]+]]: index
+//   CHECK-DAG: %[[C1:.+]] = arith.constant 1 : index
+//   CHECK-DAG: %[[C2:.+]] = arith.constant 2 : index
+//   CHECK-DAG: %[[C0:.+]] = arith.constant 0 : index
+//   CHECK-DAG: %[[PAD_H:.+]] = affine.apply #[[$MAP]]()[%[[ARG2]]]
+//   CHECK-DAG: %[[INIT:.+]] = tensor.empty() : tensor<8x2x2x1xbf16>
+//       CHECK: %[[mLOOP0:.+]] = scf.for %[[IV0:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[OUT0:.+]] = %[[INIT]])
+//       CHECK:   %[[mLOOP1:.+]] = scf.for %[[IV1:.+]] = %[[C0]] to %[[C2]] step %[[C1]] iter_args(%[[OUT1:.+]] = %[[OUT0]])
+//   CHECK-DAG:     %[[LINEAR:.+]] = affine.apply #[[$MAP1]](%[[IV0]], %[[IV1]])
+//   CHECK-DAG:     %[[DELIN:.+]]:2 = affine.delinearize_index %[[LINEAR]] into (4, 4)
+//   CHECK-DAG:     %[[PAD_SIZE:.+]] = affine.min #[[$MAP2]]()[%[[ARG2]]]
+//   CHECK-DAG:     %[[SLICE:.+]] = tensor.extract_slice %{{.*}}[0, %[[DELIN]]#0, %[[DELIN]]#1, 0] [1, 1, 1, %[[PAD_SIZE]]] [1, 1, 1, 1] : tensor<16x194x130x?xbf16> to tensor<1x1x1x?xbf16>
+//       CHECK:     %[[PAD:.+]] = tensor.pad %[[SLICE]] low[0, 0, 0, 0] high[0, 0, 0, %[[PAD_H]]] {
+//       CHECK:       ^bb0(%[[IDX0:.+]]: index, %[[IDX1:.+]]: index, %[[IDX2:.+]]: index, %[[IDX3:.+]]: index):
+//       CHECK:         tensor.yield {{.*}} : bf16
+//       CHECK:     } : tensor<1x1x1x?xbf16> to tensor<1x1x1x8xbf16>
+//       CHECK: return %[[mLOOP0]] : tensor<8x2x2x1xbf16>
