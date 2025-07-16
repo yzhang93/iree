@@ -402,63 +402,72 @@ swapCollapseShapeWithSlice(RewriterBase &rewriter,
       // Special case especially for collapse shape of convolution filter in
       // IGEMM, while the offset is dynamic and size is static.
       if (isa<Attribute>(collapsedSize) && isa<Value>(collapsedOffset) &&
-          reassocIndices.size() == 3) {
-
+          reassocIndices.size() != 1) {
         // Check if offset is from affine.apply of form (d0 * K) or (K * d0).
         auto applyOp = collapsedOffset.dyn_cast<Value>()
                            .getDefiningOp<affine::AffineApplyOp>();
-        if (!applyOp)
+        if (!applyOp) {
           return rewriter.notifyMatchFailure(sliceOp,
                                              "offset is not from affine.apply");
+        }
 
         AffineMap map = applyOp.getAffineMap();
-        if (map.getNumInputs() != 1 || map.getNumResults() != 1)
+        if (map.getNumInputs() != 1 || map.getNumResults() != 1) {
           return rewriter.notifyMatchFailure(
-              sliceOp, "affine.apply map is not (d0 * K)");
+              sliceOp, "affine.apply map is not of form (d0 * K)");
+        }
 
         AffineExpr expr = map.getResult(0);
-        auto binOp = dyn_cast<AffineBinaryOpExpr>(expr);
-        if (!binOp || binOp.getKind() != AffineExprKind::Mul)
-          return rewriter.notifyMatchFailure(
-              sliceOp, "affine.apply is not a multiplication");
+        int64_t multiplier;
+        if (auto dimExpr = dyn_cast<AffineDimExpr>(expr)) {
+          multiplier = 1;
+        } else if (auto binOp = dyn_cast<AffineBinaryOpExpr>(expr)) {
+          if (!binOp || binOp.getKind() != AffineExprKind::Mul) {
+            return rewriter.notifyMatchFailure(
+                sliceOp, "affine.apply is not a multiplication");
+          }
+          auto constExpr = isa<AffineConstantExpr>(binOp.getLHS())
+                               ? dyn_cast<AffineConstantExpr>(binOp.getLHS())
+                               : dyn_cast<AffineConstantExpr>(binOp.getRHS());
+          if (!constExpr) {
+            return rewriter.notifyMatchFailure(
+                sliceOp, "affine.apply must multiply by a constant");
+          }
+          multiplier = constExpr.getValue();
+        } else {
+          return rewriter.notifyMatchFailure(sliceOp,
+                                             "unable to get the multiplier");
+        }
 
-        auto constExpr = isa<AffineConstantExpr>(binOp.getLHS())
-                             ? dyn_cast<AffineConstantExpr>(binOp.getLHS())
-                             : dyn_cast<AffineConstantExpr>(binOp.getRHS());
-        if (!constExpr)
-          return rewriter.notifyMatchFailure(
-              sliceOp, "affine.apply must multiply by a constant");
-
-        int64_t multiplier = constExpr.getValue();
         auto maybeStaticSize = getConstantIntValue(collapsedSize);
-        if (!maybeStaticSize || maybeStaticSize.value() % multiplier != 0) {
+        if (!maybeStaticSize) {
+          return rewriter.notifyMatchFailure(sliceOp,
+                                             "collapsed size must be static");
+        }
+        if (maybeStaticSize.value() % multiplier != 0) {
           return rewriter.notifyMatchFailure(
               sliceOp, "collapsed size is not divisible by offset multiplier");
         }
+        unsigned lastReassocSize = srcShape[reassocIndices.back()];
+        if (lastReassocSize % maybeStaticSize.value() != 0) {
+          return rewriter.notifyMatchFailure(
+              sliceOp,
+              "the last expanded size is not divisible by collapse size");
+        }
 
         // Calculate expanded offsets and sizes.
-        AffineExpr d0;
-        bindDims(rewriter.getContext(), d0);
-        int64_t W = srcShape[reassocIndices[1]];
-        int64_t C = srcShape[reassocIndices[2]];
-        auto hMap = AffineMap::get(1, 0, d0.floorDiv(W * C));
-        auto wMap = AffineMap::get(1, 0, (d0 % (W * C)).floorDiv(C));
-        auto cMap = AffineMap::get(1, 0, d0 % C);
+        SmallVector<OpFoldResult> expandedBasis;
+        for (auto dimIdx : reassocIndices) {
+          expandedBasis.push_back(rewriter.getIndexAttr(srcShape[dimIdx]));
+        }
+        auto delinearizeOp = rewriter.create<affine::AffineDelinearizeIndexOp>(
+            sliceOp.getLoc(), cast<Value>(collapsedOffset), expandedBasis);
+        ValueRange offsets = delinearizeOp.getResults();
+        expandedOffsets.append(offsets.begin(), offsets.end());
 
-        Location loc = sliceOp.getLoc();
-        auto h = affine::makeComposedFoldedAffineApply(rewriter, loc, hMap,
-                                                       {collapsedOffset});
-        auto w = affine::makeComposedFoldedAffineApply(rewriter, loc, wMap,
-                                                       {collapsedOffset});
-        auto c = affine::makeComposedFoldedAffineApply(rewriter, loc, cMap,
-                                                       {collapsedOffset});
-
-        expandedOffsets.push_back(h);
-        expandedOffsets.push_back(w);
-        expandedOffsets.push_back(c);
-
-        expandedSizes.push_back(rewriter.getIndexAttr(1));
-        expandedSizes.push_back(rewriter.getIndexAttr(1));
+        for (auto i = 0; i < reassocIndices.size() - 1; i++) {
+          expandedSizes.push_back(rewriter.getIndexAttr(1));
+        }
         expandedSizes.push_back(collapsedSize);
         continue;
       }
