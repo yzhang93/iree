@@ -27,7 +27,7 @@ LogicalResult setDataTiledMultiMmaLoweringConfig(
 LogicalResult
 setIGEMMConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
                                   mlir::FunctionOpInterface entryPoint,
-                                  Operation *op, bool useDirectLoad = false);
+                                  Operation *op, bool useDirectLoad = false, bool padConv = true);
 
 /// Helper for setting up a matmul config based on the specified target.
 /// TODO: Currently this only succeeds if the target supports an mma

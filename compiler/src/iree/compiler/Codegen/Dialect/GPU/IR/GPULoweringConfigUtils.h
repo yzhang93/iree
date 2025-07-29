@@ -71,7 +71,8 @@ IREE::GPU::LoweringConfigAttr setPromotedOperandsList(
     std::optional<ArrayRef<Attribute>> promotionTypes = std::nullopt);
 
 /// Helper to retrieve  list of operand to pad.
-std::optional<SmallVector<int64_t>> getPaddingList(LoweringConfigAttr config);
+std::optional<SmallVector<int64_t>> getPaddingList(LoweringConfigAttr config,
+                                                   bool paddingConv = false);
 
 IREE::GPU::UKernelConfigAttr
 getUkernelSpec(IREE::GPU::LoweringConfigAttr config);

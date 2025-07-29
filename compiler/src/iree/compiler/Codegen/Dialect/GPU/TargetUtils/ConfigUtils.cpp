@@ -210,8 +210,10 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
                                         ArrayRef<AffineMap> maps,
                                         ArrayRef<Value> operands,
                                         IREE::GPU::TargetAttr target,
-                                        bool useDirectLoad, bool scaled) {
-  if (target.getWgp().getMma().empty()) {
+                                        bool useDirectLoad,
+                                        bool scaled,
+                                        std::optional<mlir::linalg::ConvolutionDimensions> padConvDims) {
+  if (target.getWgp().getMma().empty())
     return failure();
   }
 
@@ -455,6 +457,11 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
     paddingTileSizes[innerKDim] *= kPackFactor;
     attrs.emplace_back(StringAttr::get(context, "padding"),
                        b.getI64ArrayAttr(paddingTileSizes));
+    if (padConvDims.has_value()){
+      SmallVector<int64_t> paddingConvSizes = {1, 8, 32, 32, 0, 0, 32};
+      attrs.emplace_back(StringAttr::get(context, "padding_conv"),
+                         b.getI64ArrayAttr(paddingConvSizes));
+    }
   }
   auto configDict = DictionaryAttr::get(context, attrs);
   auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
@@ -469,7 +476,8 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
 LogicalResult
 setIGEMMConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
                                   mlir::FunctionOpInterface entryPoint,
-                                  Operation *op, bool useDirectLoad) {
+                                  Operation *op, bool useDirectLoad,
+                                  bool padConv) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
   if (!linalgOp || !linalg::isaConvolutionOpInterface(linalgOp)) {
     return failure();
@@ -490,12 +498,15 @@ setIGEMMConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
   SmallVector<int64_t> igemmLoopBounds =
       igemmGenericConvDetails->igemmLoopBounds;
   SmallVector<Value> igemmOperands = igemmGenericConvDetails->igemmOperands;
-
+  std::optional<mlir::linalg::ConvolutionDimensions> padConvDims;
+  if (padConv)
+    padConvDims = igemmGenericConvDetails->convDims;
+  
   SmallVector<int64_t> bounds = igemmLoopBounds;
   FailureOr<std::pair<LoweringConfigAttr, int64_t>> configAndWgSize =
       getMatmulLoweringConfigAndWorkgroupSize(bounds, igemmContractionMaps,
                                               igemmOperands, target,
-                                              useDirectLoad, /*scaled*/ false);
+                                              useDirectLoad, /*scaled*/ false, padConvDims);
   if (failed(configAndWgSize)) {
     return failure();
   }
@@ -550,7 +561,7 @@ LogicalResult setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
     // conflicts when dealing with scaled matmuls. For now it is disabled.
     useDirectLoad = true;
     configAndWgSize = getMatmulLoweringConfigAndWorkgroupSize(
-        bounds, maps, operands, target, useDirectLoad, /*scaled*/ true);
+        bounds, maps, operands, target, useDirectLoad, /*scaled*/ true, /*padConvDims*/{});
   }
 
   if (failed(configAndWgSize)) {
