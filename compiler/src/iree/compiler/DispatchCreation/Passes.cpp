@@ -327,7 +327,7 @@ void buildDispatchCreationPassPipeline(
 
   FunctionLikeNest(passManager)
       // Preprocess the input to a form more amenable for fusion.
-      .addPass(DispatchCreation::createFusionPreprocessingPass)
+      //.addPass(DispatchCreation::createFusionPreprocessingPass)
       .addPass(IREE::Flow::createCanonicalizePass)
       .addPass(mlir::createCSEPass);
 

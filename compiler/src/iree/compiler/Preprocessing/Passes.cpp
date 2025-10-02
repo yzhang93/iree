@@ -137,16 +137,17 @@ buildMakeSingleDispatchPassPipeline(OpPassManager &passManager,
   // We generalize certain named ops immediately before folding unit extent
   // dims as the unit dim folding pass updates indexing maps and is better
   // at working with generics.
-  passManager.addPass(GlobalOptimization::createGeneralizeLinalgNamedOpsPass());
-  passManager.addPass(DispatchCreation::createFoldUnitExtentDimsForFuncPass());
-  GlobalOptimization::PropagateLinalgTransposePassOptions transposeOptions;
-  transposeOptions.enableConvolutionPropagation = true;
-  transposeOptions.enableAggressivePropagation = true;
-  passManager.addPass(
-      GlobalOptimization::createPropagateLinalgTransposePass(transposeOptions));
+  // passManager.addPass(GlobalOptimization::createGeneralizeLinalgNamedOpsPass());
+  // passManager.addPass(DispatchCreation::createFoldUnitExtentDimsForFuncPass());
+  // GlobalOptimization::PropagateLinalgTransposePassOptions transposeOptions;
+  // transposeOptions.enableConvolutionPropagation = true;
+  // transposeOptions.enableAggressivePropagation = true;
+  // passManager.addPass(
+  //     GlobalOptimization::createPropagateLinalgTransposePass(transposeOptions));
   // Generalize transposes and any other remaining named linalg ops that can
   // now be represented as generics.
-  passManager.addPass(GlobalOptimization::createGeneralizeLinalgNamedOpsPass());
+  // passManager.addPass(GlobalOptimization::createGeneralizeLinalgNamedOpsPass());
+  passManager.addPass(createConvertConvFilterToChannelsLastPass());
   passManager.addPass(DispatchCreation::createFoldUnitExtentDimsForFuncPass());
   passManager.addPass(
       GlobalOptimization::createConvertStridedContractionToContractionPass());

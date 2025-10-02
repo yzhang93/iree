@@ -135,16 +135,16 @@ void buildGlobalOptimizationPassPipeline(
       .addPass([&]() {
         return createDecomposeConcatPass(
             transformOptions.options.outerDimConcat);
-      })
-      // We generalize certain named ops immediately before folding unit extent
-      // dims as the unit dim folding pass updates indexing maps and is better
-      // at working with generics. By this point we have already done any
-      // specialized raising and the op names are no longer useful.
-      .addPass([&]() {
-        GeneralizeLinalgNamedOpsPassOptions opt;
-        opt.enableGeneralizeMatmul = transformOptions.options.generalizeMatmul;
-        return createGeneralizeLinalgNamedOpsPass(opt);
       });
+  // We generalize certain named ops immediately before folding unit extent
+  // dims as the unit dim folding pass updates indexing maps and is better
+  // at working with generics. By this point we have already done any
+  // specialized raising and the op names are no longer useful.
+  //   .addPass([&]() {
+  //     GeneralizeLinalgNamedOpsPassOptions opt;
+  //     opt.enableGeneralizeMatmul = transformOptions.options.generalizeMatmul;
+  //     return createGeneralizeLinalgNamedOpsPass(opt);
+  //  });
 
   mainPassManager.addPass(DispatchCreation::createFoldUnitExtentDimsPass());
   mainPassManager.addPass(
@@ -194,7 +194,7 @@ void buildGlobalOptimizationPassPipeline(
   }
   // Generalize transposes and any other remaining named linalg ops that can
   // now be represented as generics.
-  FunctionLikeNest(mainPassManager).addPass(createGeneralizeLinalgNamedOpsPass);
+  // FunctionLikeNest(mainPassManager).addPass(createGeneralizeLinalgNamedOpsPass);
 
   // Hoist loop invariants (e.g. from scf loops) with zero-trip-check.
   FunctionLikeNest(mainPassManager)
