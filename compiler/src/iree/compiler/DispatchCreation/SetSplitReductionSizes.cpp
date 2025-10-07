@@ -4,10 +4,13 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
-#include "iree/compiler/DispatchCreation/Passes.h"
-
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
+#include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
+#include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "iree/compiler/DispatchCreation/Passes.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 
@@ -70,6 +73,94 @@ findSmallestFactorWithLowerBound(int64_t x, int64_t lowerBound) {
   return std::nullopt;
 };
 
+static FailureOr<SmallVector<int64_t>> getWorkgroupTileSizesForMatmulOrIGEMM(
+    SmallVector<int64_t> bounds, ArrayRef<AffineMap> maps,
+    ArrayRef<Value> operands, IREE::GPU::TargetAttr target, bool isGemm) {
+  if (target.getWgp().getMma().empty())
+    return failure();
+
+  // Infer contraction dims (M, N, K, Batch)
+  SmallVector<unsigned, 2> contractionM, contractionN, contractionK,
+      contractionB;
+  auto dims = mlir::linalg::inferContractionDims(maps);
+  if (failed(dims))
+    return failure();
+  contractionM = dims->m;
+  contractionN = dims->n;
+  contractionK = dims->k;
+  contractionB = dims->batch;
+
+  if (contractionM.empty() || contractionN.empty() || contractionK.empty())
+    return failure();
+
+  // Build problem shape for MMA schedule inference
+  SmallVector<int64_t> mDims, nDims, kDims, batchDims;
+  for (auto d : contractionM)
+    mDims.push_back(d);
+  for (auto d : contractionN)
+    nDims.push_back(d);
+  for (auto d : contractionK)
+    kDims.push_back(d);
+  for (auto d : contractionB)
+    batchDims.push_back(d);
+
+  Value lhs = operands[0];
+  Value rhs = operands[1];
+  Value init = operands[2];
+
+  Type lhsElemType = getElementTypeOrSelf(lhs);
+  Type rhsElemType = getElementTypeOrSelf(rhs);
+  Type initElemType = getElementTypeOrSelf(init);
+
+  bool transposedLhs =
+      kDims.back() !=
+      llvm::cast<AffineDimExpr>(maps[0].getResults().back()).getPosition();
+  bool transposedRhs =
+      nDims.back() !=
+      llvm::cast<AffineDimExpr>(maps[1].getResults().back()).getPosition();
+
+  GPUMatmulShapeType problem{
+      llvm::map_to_vector(mDims, [&](int64_t d) { return bounds[d]; }),
+      llvm::map_to_vector(nDims, [&](int64_t d) { return bounds[d]; }),
+      llvm::map_to_vector(kDims, [&](int64_t d) { return bounds[d]; }),
+      llvm::map_to_vector(batchDims, [&](int64_t d) { return bounds[d]; }),
+      lhsElemType,
+      rhsElemType,
+      initElemType};
+
+  auto schedule = getMmaScheduleFromProblemAndTarget(
+      target, problem, transposedLhs, transposedRhs, isGemm);
+  if (!schedule)
+    return failure();
+
+  // Compute workgroup tile sizes.
+  SmallVector<int64_t> workgroupTileSizes(bounds.size(), 0);
+
+  // Batch dimensions → tile = 1
+  for (int64_t b : contractionB)
+    workgroupTileSizes[b] = 1;
+
+  // M and N dimensions
+  for (auto [i, mDim] : llvm::enumerate(mDims)) {
+    workgroupTileSizes[mDim] =
+        schedule->mSubgroupCounts[i] * schedule->mTileSizes[i];
+    if (i == mDims.size() - 1)
+      workgroupTileSizes[mDim] *= schedule->mSize;
+  }
+  for (auto [i, nDim] : llvm::enumerate(nDims)) {
+    workgroupTileSizes[nDim] =
+        schedule->nSubgroupCounts[i] * schedule->nTileSizes[i];
+    if (i == nDims.size() - 1)
+      workgroupTileSizes[nDim] *= schedule->nSize;
+  }
+
+  // K dimensions (typically reduction — tile to 1)
+  for (int64_t k : contractionK)
+    workgroupTileSizes[k] = 1;
+
+  return workgroupTileSizes;
+}
+
 namespace {
 struct SetSplitReductionSizesPass final
     : public impl::SetSplitReductionSizesPassBase<SetSplitReductionSizesPass> {
@@ -94,12 +185,17 @@ struct SetSplitReductionSizesPass final
         return;
       }
 
-      std::optional<SmallVector<int64_t>> tileSizes =
-          getOuterReductionSizes(tilingOp);
-      if (!tileSizes) {
+      // --- Case 1: Outer reduction ---
+      if (auto tileSizes = getOuterReductionSizes(tilingOp)) {
+        IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
         return;
       }
-      IREE::LinalgExt::setSplitReductionAttribute(tilingOp, tileSizes.value());
+
+      // --- Case 2: Generic weight backward conv ---
+      if (auto tileSizes = getWeightBackwardReductionSizes(tilingOp)) {
+        IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
+        return;
+      }
     });
   }
 
@@ -141,6 +237,100 @@ private:
       tileSizes[i] = tileSize;
       currentSplitReductionSize *= tileSize;
     }
+    return tileSizes;
+  }
+
+  std::optional<SmallVector<int64_t>>
+  getWeightBackwardReductionSizes(PartialReductionOpInterface op) const {
+    // First check if the input op is a convolution with CHWN layout.
+    auto linalgOp = cast<linalg::LinalgOp>(op.getOperation());
+    if (!linalgOp || !linalg::isaConvolutionOpInterface(linalgOp)) {
+      LDBG() << "skipping op; not convolution";
+      return std::nullopt;
+    }
+
+    FailureOr<mlir::linalg::ConvolutionDimensions> convDims =
+        mlir::linalg::inferConvolutionDims(linalgOp);
+    if (failed(convDims)) {
+      LDBG() << "skipping op; failed to infer convolution dims";
+      return std::nullopt;
+    }
+
+    OpOperand *input = linalgOp.getDpsInputOperand(0);
+    OpOperand *filter = linalgOp.getDpsInputOperand(1);
+    OpOperand *output = linalgOp.getDpsInitOperand(0);
+
+    // AffineMap inputMap = linalgOp.getMatchingIndexingMap(input);
+    // AffineMap filterMap = linalgOp.getMatchingIndexingMap(filter);
+    AffineMap outputMap = linalgOp.getMatchingIndexingMap(output);
+
+    Value inputVal = input->get();
+    Value filterVal = filter->get();
+    Value outputVal = output->get();
+
+    ArrayRef<int64_t> inputShape =
+        llvm::cast<ShapedType>(inputVal.getType()).getShape();
+    ArrayRef<int64_t> filterShape =
+        llvm::cast<ShapedType>(filterVal.getType()).getShape();
+    ArrayRef<int64_t> outputShape =
+        llvm::cast<ShapedType>(outputVal.getType()).getShape();
+
+    // TODO(vivian): Support dynamic shapes.
+    if (ShapedType::isDynamicShape(inputShape) ||
+        ShapedType::isDynamicShape(filterShape) ||
+        ShapedType::isDynamicShape(outputShape)) {
+      LDBG() << "skipping op; has dynamic shape";
+      return std::nullopt;
+    }
+
+    std::optional<int64_t> batchLastDim = outputMap.getResultPosition(
+        getAffineDimExpr(convDims->batch.back(), outputMap.getContext()));
+    if (!batchLastDim || batchLastDim.value() != outputShape.size() - 1) {
+      LDBG() << "skipping op; not batch last layout";
+      return std::nullopt;
+    }
+
+    std::optional<SmallVector<int64_t>> maybeSizes =
+        getReductionDimSizes(op.getOperation());
+    if (!maybeSizes) {
+      LDBG() << "skipping op; failed to get reduction sizes";
+      return std::nullopt;
+    }
+    SmallVector<int64_t> opReductionSizes = std::move(*maybeSizes);
+    SmallVector<int64_t> tileSizes(opReductionSizes.size());
+
+    // Try to prefetch the workgroup tile sizes.
+    IREE::GPU::TargetAttr target = getGPUTargetAttr(op.getOperation());
+    if (!target) {
+      LDBG() << "skipping op; missing GPU target";
+      return std::nullopt;
+    }
+
+    FailureOr<IREE::LinalgExt::IGEMMGenericConvDetails>
+        igemmGenericConvDetails =
+            IREE::LinalgExt::getIGEMMGenericConvDetails(linalgOp);
+    if (failed(igemmGenericConvDetails)) {
+      LDBG() << "skipping op; unsupported convolution type";
+      return std::nullopt;
+    }
+    SmallVector<AffineMap> igemmContractionMaps =
+        igemmGenericConvDetails->igemmContractionMaps;
+    SmallVector<int64_t> igemmLoopBounds =
+        igemmGenericConvDetails->igemmLoopBounds;
+    SmallVector<Value> igemmOperands = igemmGenericConvDetails->igemmOperands;
+    FailureOr<SmallVector<int64_t>> maybeWgTileSize =
+        getWorkgroupTileSizesForMatmulOrIGEMM(
+            igemmLoopBounds, igemmContractionMaps, igemmOperands, target,
+            /*isGemm=*/false);
+    if (failed(maybeWgTileSize)) {
+      LDBG() << "skipping op; failed to prefetch workgroup tile sizes";
+      return std::nullopt;
+    }
+    SmallVector<int64_t> wgTileSize = maybeWgTileSize.value();
+    for (auto i : wgTileSize) {
+      llvm::outs() << "HERE " << i << "\n";
+    }
+
     return tileSizes;
   }
 };

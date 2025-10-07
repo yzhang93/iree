@@ -236,10 +236,10 @@ static GemmCutoff computeGemmCutoffsForAI(IREE::GPU::TargetAttr target,
 
 /// Given a target and a matmul problem, try to find an MMA schedule for the
 /// problem based on the available mma intrinsics.
-static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
+std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
     IREE::GPU::TargetAttr target, GPUMatmulShapeType problem,
-    bool transposedLhs, bool transposedRhs, bool isGemm,
-    bool mustBeAligned = true, bool doCPromotion = false, bool scaled = false) {
+    bool transposedLhs, bool transposedRhs, bool isGemm, bool mustBeAligned,
+    bool doCPromotion, bool scaled) {
   const int64_t targetSubgroupSize = target.getPreferredSubgroupSize();
   SmallVector<GPUIntrinsicType> intrinsics;
   if (scaled) {

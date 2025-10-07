@@ -8,6 +8,8 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUInterfaces.h"
 #include "mlir/IR/Types.h"
 
+#pragma once
+
 namespace mlir::iree_compiler {
 
 enum class GemmSize { NotSet, SmallGemm, MediumGemm, LargeGemm };

@@ -7,6 +7,7 @@
 #ifndef IREE_COMPILER_CODEGEN_DIALECT_GPU_TARGETUTILS_CONFIGUTILS_H_
 #define IREE_COMPILER_CODEGEN_DIALECT_GPU_TARGETUTILS_CONFIGUTILS_H_
 
+#include "iree/compiler/Codegen/Common/GPU/GPUHeuristics.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "mlir/IR/Operation.h"
@@ -57,6 +58,17 @@ LogicalResult setScatterLoweringConfig(IREE::GPU::TargetAttr target,
 LogicalResult setSortConfig(IREE::GPU::TargetAttr target,
                             mlir::FunctionOpInterface entryPoint,
                             Operation *op);
+
+// FailureOr<std::pair<LoweringConfigAttr, int64_t>>
+// getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
+//     SmallVector<int64_t> bounds, ArrayRef<AffineMap> maps,
+//     ArrayRef<Value> operands, IREE::GPU::TargetAttr target, bool
+//     useDirectLoad, bool isGemm, bool scaled, std::optional<ConvToIgemmInfo>);
+
+std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
+    TargetAttr target, GPUMatmulShapeType problem, bool transposedLhs,
+    bool transposedRhs, bool isGemm, bool mustBeAligned = true,
+    bool doCPromotion = false, bool scaled = false);
 
 //===----------------------------------------------------------------------===//
 // Pass Pipeline Options
