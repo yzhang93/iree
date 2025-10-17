@@ -279,7 +279,11 @@ private:
     return tileSizes;
   }
 
-  /// Split reduction on GEMM
+  /// Determines split reduction sizes for matmul-like operations where the K
+  /// dimension is significantly larger than the M or N dimensions. Currently,
+  /// splitting is only applied along the outermost reduction dimension. Note
+  /// that the constant threshold is empirically chosen based on limited data,
+  /// and may not generalize to all cases.
   std::optional<SmallVector<int64_t>>
   getMatmulLikeReductionSizes(PartialReductionOpInterface op) const {
     // Matmul-like op should have at least 1 reduction, which is checked by the
@@ -328,24 +332,20 @@ private:
     int64_t nSize = getSizeAt(nDims);
     int64_t kSize = getSizeAt(kDims);
 
-    // When the M and N sizes are large, the workload tends
-    // to distributed across many workgroups, making split reduction little to
-    // no effect.
-    const int64_t largeDimSize = 512;
-    if (mSize >= largeDimSize || nSize >= largeDimSize) {
-      LDBG() << "skipping op; large M or N size";
+    // The constants below are determined based on empirical data.
+    const int64_t ratioThreshold = 384;
+    const int64_t largeKSize = 24576;
+    int64_t ratio = kSize / std::sqrt(mSize * nSize) / batchSize;
+    if (ratio <= ratioThreshold && kSize < largeKSize) {
+      LDBG() << "skipping op; small reduction size";
       return std::nullopt;
     }
 
-    // int64_t ratio = kSize / std::sqrt(batchSize * mSize * nSize);
-    // //const int64_t threshold = 384;
-    // if (ratio < 384) {
-    //   LDBG() << "skipping op; small reduction size";
-    //   return std::nullopt;
-    // }
-
+    // Only split along the outermost reduction dimension.
+    // TODO(vivian): split more reduction dimensions if needed.
+    const int64_t limitParallelLoops = 128;
     SmallVector<int64_t> tileSizes = std::move(*maybeSizes);
-    tileSizes[0] = std::ceil(float(tileSizes[0]) / largeDimSize);
+    tileSizes[0] = std::ceil(float(tileSizes[0]) / limitParallelLoops);
     return tileSizes;
   }
 };
