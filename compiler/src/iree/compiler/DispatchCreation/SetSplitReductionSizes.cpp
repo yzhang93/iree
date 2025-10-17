@@ -104,6 +104,12 @@ struct SetSplitReductionSizesPass final
         IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
         return;
       }
+
+      // --- Case 3: Matmul-like operations ---
+      if (auto tileSizes = getMatmulLikeReductionSizes(tilingOp)) {
+        IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
+        return;
+      }
     });
   }
 
@@ -270,6 +276,76 @@ private:
       return std::nullopt;
     }
     tileSizes[cDim] = std::ceil(float(tileSizes[cDim]) / largeDimSize);
+    return tileSizes;
+  }
+
+  /// Split reduction on GEMM
+  std::optional<SmallVector<int64_t>>
+  getMatmulLikeReductionSizes(PartialReductionOpInterface op) const {
+    // Matmul-like op should have at least 1 reduction, which is checked by the
+    // contraction interface, and at least 2 parallel dimensions.
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(op.getOperation());
+    if (!linalgOp) {
+      LDBG() << "skipping op; not a linalg op";
+      return std::nullopt;
+    }
+
+    FailureOr<linalg::ContractionDimensions> maybeContractionDims =
+        linalg::inferContractionDims(linalgOp);
+    if (failed(maybeContractionDims)) {
+      LDBG() << "skipping op; failed to infer contraction dims";
+      return std::nullopt;
+    }
+
+    if (linalgOp.getNumParallelLoops() < 2) {
+      LDBG() << "skipping op; has less than 2 parallel dims";
+      return std::nullopt;
+    }
+
+    std::optional<SmallVector<int64_t>> maybeSizes =
+        getReductionDimSizes(op.getOperation());
+    if (!maybeSizes) {
+      LDBG() << "skipping op; failed to get reduction sizes";
+      return std::nullopt;
+    }
+
+    linalg::ContractionDimensions contractionDims = *maybeContractionDims;
+    auto batchDims = contractionDims.batch;
+    auto mDims = contractionDims.m;
+    auto nDims = contractionDims.n;
+    auto kDims = contractionDims.k;
+
+    SmallVector<int64_t> shapes = linalgOp.getStaticLoopRanges();
+    auto getSizeAt = [&shapes](ArrayRef<unsigned> idx) {
+      int64_t totalSize = 1;
+      for (unsigned i : idx)
+        totalSize *= shapes[i];
+      return totalSize;
+    };
+
+    int64_t batchSize = getSizeAt(batchDims);
+    int64_t mSize = getSizeAt(mDims);
+    int64_t nSize = getSizeAt(nDims);
+    int64_t kSize = getSizeAt(kDims);
+
+    // When the M and N sizes are large, the workload tends
+    // to distributed across many workgroups, making split reduction little to
+    // no effect.
+    const int64_t largeDimSize = 512;
+    if (mSize >= largeDimSize || nSize >= largeDimSize) {
+      LDBG() << "skipping op; large M or N size";
+      return std::nullopt;
+    }
+
+    // int64_t ratio = kSize / std::sqrt(batchSize * mSize * nSize);
+    // //const int64_t threshold = 384;
+    // if (ratio < 384) {
+    //   LDBG() << "skipping op; small reduction size";
+    //   return std::nullopt;
+    // }
+
+    SmallVector<int64_t> tileSizes = std::move(*maybeSizes);
+    tileSizes[0] = std::ceil(float(tileSizes[0]) / largeDimSize);
     return tileSizes;
   }
 };
