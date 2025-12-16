@@ -1671,17 +1671,18 @@ setDirectConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
     return failure();
   }
 
-  // This strategy turns non-strided convolution problems into matmul problems
-  // by tiling certain dimensions to 1:
-  //  - Filter dimensions (reduction on the filter, and convolved on the image).
-  //  - All parallel dimensions except the innermost output channel dimension
-  //    and output image/batch dimension.
+  // This strategy configures direct convolution by treating it as a matmul-like
+  // operation. The approach:
+  //  - Maps batch and output image dimensions to M dimensions.
+  //  - Maps output channel dimensions to N dimensions.
+  //  - Maps input channel and filter loop dimensions to K (reduction)
+  //  dimensions.
+  //  - Tiles all but the innermost M, N, K dimensions to size 1.
+  //  - Deduces an MMA schedule based on static dimensions only.
+  //  - Supports both aligned and unaligned schedules with padding when needed.
   //
-  // After this, the remaining non-unit dimensions are:
-  //  - One output image or batch dimension corresponding to the M dimension of
-  //    a matmul.
-  //  - One output channel dimension, corresponding to the N dimension.
-  //  - One input channel dimension, corresponding to the K dimension.
+  // Dynamic dimensions are filtered out when computing the MMA schedule, but
+  // are still tiled appropriately in the final configuration.
 
   // TODO: Relax this condition to strictly alignment requirements.
   if (convolutionDims->outputChannel.size() < 1 ||
@@ -1723,42 +1724,76 @@ setDirectConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
   batchDims.append(convolutionDims->depth.begin(),
                    convolutionDims->depth.end());
 
-  auto getDimBounds = [&](SmallVector<int64_t> dims) -> SmallVector<int64_t> {
+  // TODO(Max191): add dynamic shape support for inner most dims.
+  if (ShapedType::isDynamic(bounds[mDims.back()]) ||
+      ShapedType::isDynamic(bounds[nDims.back()]) ||
+      ShapedType::isDynamic(bounds[kDims.back()])) {
+    return failure();
+  }
+
+  // We can support unaligned shapes as long as there are no dynamic dimensions
+  // as finding padding bounds for dynamic dimensions is not guaranteed.
+  bool canSupportUnaligned = true;
+
+  // Gather all static M, N, and K dimensions to deduce the MMASchedule. Dynamic
+  // dimensions will be tiled to 1 in workgroup tiling, so they are ignored when
+  // computing an MMA schedule.
+  SmallVector<int64_t> staticMDims, staticNDims, staticKDims, staticBatchDims;
+  for (int64_t mDim : mDims) {
+    if (ShapedType::isDynamic(bounds[mDim])) {
+      canSupportUnaligned = false;
+      continue;
+    }
+    staticMDims.push_back(mDim);
+  }
+  for (int64_t nDim : nDims) {
+    if (ShapedType::isDynamic(bounds[nDim])) {
+      canSupportUnaligned = false;
+      continue;
+    }
+    staticNDims.push_back(nDim);
+  }
+  for (int64_t kDim : kDims) {
+    if (ShapedType::isDynamic(bounds[kDim])) {
+      canSupportUnaligned = false;
+      continue;
+    }
+    staticKDims.push_back(kDim);
+  }
+  for (int64_t batchDim : batchDims) {
+    if (ShapedType::isDynamic(bounds[batchDim])) {
+      canSupportUnaligned = false;
+      continue;
+    }
+    staticBatchDims.push_back(batchDim);
+  }
+
+  auto getDimBounds = [&](ArrayRef<int64_t> dims) -> SmallVector<int64_t> {
     return llvm::map_to_vector(dims, [&](int64_t dim) { return bounds[dim]; });
   };
 
-  // SmallVector<unsigned> batchAndImageDims;
-  // batchAndImageDims.append(convolutionDims->batch.begin(),
-  //                          convolutionDims->batch.end());
-  // batchAndImageDims.append(convolutionDims->outputImage.begin(),
-  //                          convolutionDims->outputImage.end());
-  // llvm::sort(batchAndImageDims);
-
-  // // TODO: Support tiling and finding mma schedule on multiple M/N/K
-  // dimensions. int64_t mDim = batchAndImageDims.back(); int64_t nDim =
-  // convolutionDims->outputChannel.back(); int64_t kDim =
-  // convolutionDims->inputChannel.back(); GPUMatmulShapeType
-  // problem{bounds[mDim], bounds[nDim], bounds[kDim],
-  //                            lhsElemType,  rhsElemType,  initElemType};
-
-  GPUMatmulShapeType problem{getDimBounds(mDims), getDimBounds(nDims),
-                             getDimBounds(kDims), getDimBounds(batchDims),
-                             lhsElemType,         rhsElemType,
+  GPUMatmulShapeType problem{getDimBounds(staticMDims),
+                             getDimBounds(staticNDims),
+                             getDimBounds(staticKDims),
+                             getDimBounds(staticBatchDims),
+                             lhsElemType,
+                             rhsElemType,
                              initElemType};
 
+  // Infer if lhs or rhs is transposed to help generate better schedule.
   AffineMap inputMap = linalgOp.getIndexingMapsArray()[0];
   AffineMap filterMap = linalgOp.getIndexingMapsArray()[1];
   int64_t mPos, nPos, lhsKPos, rhsKPos;
   for (auto [idx, e] : llvm::enumerate(inputMap.getResults())) {
-    if (e.isFunctionOfDim(mDims.back())) {
+    if (e.isFunctionOfDim(staticMDims.back())) {
       mPos = idx;
     }
-    if (e.isFunctionOfDim(kDims.back())) {
+    if (e.isFunctionOfDim(staticKDims.back())) {
       lhsKPos = idx;
     }
   }
   for (auto [idx, e] : llvm::enumerate(filterMap.getResults())) {
-    if (e.isFunctionOfDim(nDims.back())) {
+    if (e.isFunctionOfDim(staticNDims.back())) {
       nPos = idx;
     }
     if (e.isFunctionOfDim(convolutionDims->inputChannel.back())) {
@@ -1773,15 +1808,15 @@ setDirectConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
       mustBeAligned, /*doCPromotion=*/false, /*scaled=*/false,
       splitReductionTripCnt);
 
-  if (!schedule) {
-    LDBG() << "Attempting to deduce unaligned TileAndFuse MMA schedule";
-    mustBeAligned = false;
-    schedule = getMmaScheduleFromProblemAndTarget(
-        target, problem, transposedLhs, transposedRhs, /*isGemm=*/false,
-        mustBeAligned, /*doCPromotion=*/false, /*scaled=*/false,
-        splitReductionTripCnt);
-  }
-  if (!schedule) {
+  // if (!schedule && canSupportUnaligned) {
+  //   LDBG() << "Attempting to deduce unaligned TileAndFuse MMA schedule";
+  //   mustBeAligned = false;
+  //   schedule = getMmaScheduleFromProblemAndTarget(
+  //       target, problem, transposedLhs, transposedRhs, /*isGemm=*/false,
+  //       mustBeAligned, /*doCPromotion=*/false, /*scaled=*/false,
+  //       splitReductionTripCnt);
+  // }
+  if (!schedule || !canSupportUnaligned) {
     LDBG() << "Failed to deduce TileAndFuse MMA schedule";
     return failure();
   }
@@ -1799,10 +1834,6 @@ setDirectConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
   for (int64_t depth : convolutionDims->depth) {
     workgroupTileSizes[depth] = 1;
   }
-  // // Tile all filter loop dimensions to 1.
-  // for (int64_t f : convolutionDims->filterLoop) {
-  //   reductionTileSizes[f] = 1;
-  // }
   // Tile all m, n, k dimensions to 1 except the innermost.
   for (int64_t oi : llvm::drop_end(mDims)) {
     workgroupTileSizes[oi] = 1;
@@ -1815,40 +1846,31 @@ setDirectConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
   }
 
   // Compute the M/N dimension tile sizes by multiplying subgroup information.
-  for (auto [i, mDim] : llvm::enumerate(mDims)) {
+  for (auto [i, mDim] : llvm::enumerate(staticMDims)) {
     workgroupTileSizes[mDim] =
         schedule->mSubgroupCounts[i] * schedule->mTileSizes[i];
     // Multiply by the intrinsic shape for the inner most dim as we distribute
     // to workgroups before packing to intrinsic.
-    if (i == mDims.size() - 1) {
+    if (i == staticMDims.size() - 1) {
       workgroupTileSizes[mDim] *= schedule->getTotalMSize();
     }
     subgroupTileSizes[mDim] = schedule->mTileSizes[i];
   }
-  for (auto [i, nDim] : llvm::enumerate(nDims)) {
+  for (auto [i, nDim] : llvm::enumerate(staticNDims)) {
     workgroupTileSizes[nDim] =
         schedule->nSubgroupCounts[i] * schedule->nTileSizes[i];
     // Multiply by the intrinsic shape for the inner most dim as we distribute
     // to workgroups before packing to intrinsic.
-    if (i == nDims.size() - 1) {
+    if (i == staticNDims.size() - 1) {
       workgroupTileSizes[nDim] *= schedule->getTotalNSize();
     }
     subgroupTileSizes[nDim] = schedule->nTileSizes[i];
   }
 
   // Similarly the reduction tile size is just the post-packing tile count.
-  for (auto [i, kDim] : llvm::enumerate(kDims)) {
+  for (auto [i, kDim] : llvm::enumerate(staticKDims)) {
     reductionTileSizes[kDim] = schedule->kTileSizes[i];
   }
-  // workgroupTileSizes[mDim] = schedule->mSubgroupCounts[0] *
-  //                            schedule->mTileSizes[0] * schedule->mSizes[0];
-  // subgroupTileSizes[mDim] = schedule->mTileSizes[0];
-  // workgroupTileSizes[nDim] = schedule->nSubgroupCounts[0] *
-  //                            schedule->nTileSizes[0] * schedule->nSizes[0];
-  // subgroupTileSizes[nDim] = schedule->nTileSizes[0];
-
-  // // The reduction tile size is just the post-packing tile count.
-  // reductionTileSizes[kDim] = schedule->kTileSizes[0];
 
   MLIRContext *context = linalgOp.getContext();
   Builder b(context);
@@ -1860,19 +1882,19 @@ setDirectConvolutionLoweringConfig(IREE::GPU::TargetAttr target,
   IREE::Codegen::InnerTileDescAttrInterface kind = schedule->mmaKind;
   IREE::GPU::setMmaKind(context, attrs, kind);
 
-  if (!mustBeAligned) {
-    SmallVector<int64_t> paddingTileSizes = workgroupTileSizes;
+  // if (!mustBeAligned) {
+  //   SmallVector<int64_t> paddingTileSizes = workgroupTileSizes;
 
-    // Initialize inner and outer padding sizes from reductionTileSizes.
-    for (int64_t kDim : kDims) {
-      paddingTileSizes[kDim] = reductionTileSizes[kDim];
-    }
+  //   // Initialize inner and outer padding sizes from reductionTileSizes.
+  //   for (int64_t kDim : staticKDims) {
+  //     paddingTileSizes[kDim] = reductionTileSizes[kDim];
+  //   }
 
-    auto mmaKind = cast<IREE::GPU::MmaInterfaceAttr>(kind);
-    int64_t kPackFactor = std::get<2>(mmaKind.getMNKShape());
-    paddingTileSizes[convolutionDims->inputChannel.back()] *= kPackFactor;
-    attrs.emplace_back("padding_conv", b.getI64ArrayAttr(paddingTileSizes));
-  }
+  //   auto mmaKind = cast<IREE::GPU::MmaInterfaceAttr>(kind);
+  //   int64_t kPackFactor = std::get<2>(mmaKind.getMNKShape());
+  //   paddingTileSizes[convolutionDims->inputChannel.back()] *= kPackFactor;
+  //   attrs.emplace_back("padding_conv", b.getI64ArrayAttr(paddingTileSizes));
+  // }
 
   auto configDict = DictionaryAttr::get(context, attrs);
   auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
