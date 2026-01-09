@@ -36,6 +36,77 @@ static Value createTranspose(OpBuilder &builder, Value source,
       ->getResult(0);
 }
 
+// Sinks a transpose through a tensor.expand_shape
+// Adapted from PropagateLinalgTranspose.cpp::SinkTransposeThroughExpandShape
+class SinkTransposeThroughExpandShapeOp
+    : public OpRewritePattern<tensor::ExpandShapeOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::ExpandShapeOp expandOp,
+                                PatternRewriter &rewriter) const override {
+    if (!IREE::Flow::isNonNullAndOutsideDispatch(expandOp)) {
+      return failure();
+    }
+    Value source = expandOp.getSrc();
+    auto transposeOp = source.getDefiningOp<linalg::TransposeOp>();
+    if (!transposeOp) {
+      return failure();
+    }
+
+    // Get the inverse permutation
+    auto invPerm = invertPermutationVector(transposeOp.getPermutation());
+    SmallVector<ReassociationIndices> reassociations =
+        expandOp.getReassociationIndices();
+
+    // Because we are doing expand_shape(transpose), all expanded groups are
+    // transposed together. As a result, to get the permutation of the new
+    // transpose, we can just flatten the transposed reassociation indices.
+    // For example:
+    //   permutation = [0, 2, 1]
+    //   reassociation_map = [[0, 1, 2], [3], [4, 5]]
+    // Becomes:
+    //   reassociation_map = [[0, 1, 2], [3, 4], [5]]
+    //   permutation = [0, 1, 2, 4, 5, 3]
+    applyPermutationToVector(reassociations, invPerm);
+
+    SmallVector<int64_t> newInvPerm;
+    SmallVector<ReassociationIndices> newReassociations;
+    int64_t expandedDim = 0;
+    for (auto reassoc : reassociations) {
+      ReassociationIndices newReassoc;
+      for (auto dim : reassoc) {
+        newInvPerm.push_back(dim);
+        newReassoc.push_back(expandedDim++);
+      }
+      newReassociations.push_back(newReassoc);
+    }
+
+    auto newPerm = invertPermutationVector(newInvPerm);
+
+    // Compute the new expanded type by permuting the shape
+    auto oldExpandedType = cast<RankedTensorType>(expandOp.getType());
+    SmallVector<int64_t> newExpandedShape;
+    for (int64_t dim : newInvPerm) {
+      newExpandedShape.push_back(oldExpandedType.getShape()[dim]);
+    }
+    auto newExpandedType = RankedTensorType::get(
+        newExpandedShape, oldExpandedType.getElementType(),
+        oldExpandedType.getEncoding());
+
+    // Create new expand_shape on the untransposed input
+    Value transposedReshape = tensor::ExpandShapeOp::create(
+        rewriter, expandOp.getLoc(), newExpandedType, transposeOp.getInput(),
+        newReassociations);
+
+    // Create new transpose on the expanded result
+    Value originalReshape =
+        createTranspose(rewriter, transposedReshape, newPerm);
+    rewriter.replaceOp(expandOp, originalReshape);
+    return success();
+  }
+};
+
 // Sinks a transpose through a tensor.pad
 class SinkTransposeThroughPadOp : public OpRewritePattern<tensor::PadOp> {
 public:
@@ -86,7 +157,9 @@ struct SinkTransposeThroughPadPass
           SinkTransposeThroughPadPass> {
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
-    patterns.insert<SinkTransposeThroughPadOp>(&getContext());
+    patterns
+        .insert<SinkTransposeThroughExpandShapeOp, SinkTransposeThroughPadOp>(
+            &getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
       getOperation().emitError(getPassName()) << " failed to converge.";
       return signalPassFailure();
