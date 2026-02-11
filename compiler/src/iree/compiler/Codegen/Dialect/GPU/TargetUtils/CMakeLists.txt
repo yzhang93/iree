@@ -55,3 +55,9 @@ iree_cc_library(
 )
 
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
+
+# Add GPUAnalyticalModel dependency for ConfigUtils
+target_link_libraries(iree_compiler_Codegen_Dialect_GPU_TargetUtils_ConfigUtils
+  PUBLIC
+    iree_compiler_Codegen_Common_GPU_GPUAnalyticalModel
+)

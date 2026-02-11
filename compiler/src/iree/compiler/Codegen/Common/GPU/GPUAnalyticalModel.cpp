@@ -9,541 +9,373 @@
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/MathExtras.h"
 
-#define DEBUG_TYPE "iree-gpu-analytical-model"
+#include <algorithm>
+#include <cmath>
 
-using namespace mlir::iree_compiler;
+#define DEBUG_TYPE "iree-gpu-analytical-model"
 
 namespace mlir::iree_compiler {
 
 //===----------------------------------------------------------------------===//
-// Cache Hierarchy Modeling
+// 1.  BLOCK_K — derived from cache-line width
 //===----------------------------------------------------------------------===//
+// The narrowest useful K-tile is one that completely fills a cache line so that
+// every global-memory transaction is fully utilised.
+//
+//   BLOCK_K = cacheLineBytes / elementBytes
+//
+// This is exactly the rule tritonBLAS uses.  For FP16 with a 128-byte cache
+// line this gives BLOCK_K = 64.
 
-float GPUAnalyticalModel::estimateDataReuse(int64_t tileM, int64_t tileN,
-                                            int64_t tileK, int64_t problemM,
-                                            int64_t problemN,
-                                            int64_t problemK) {
-  // Estimate reuse based on how many times each element is accessed
-  // For matmul: A is reused N times, B is reused M times
-  float reuseA = static_cast<float>(tileN) / static_cast<float>(problemN);
-  float reuseB = static_cast<float>(tileM) / static_cast<float>(problemM);
-  return (reuseA + reuseB) / 2.0f;
-}
-
-float GPUAnalyticalModel::estimateCacheHitRate(int64_t tileM, int64_t tileN,
-                                               int64_t tileK, int64_t problemM,
-                                               int64_t problemN,
-                                               int64_t problemK) {
-  // Estimate cache hit rate based on tile size relative to cache capacity
-  int64_t tileSizeBytes = (tileM * tileK + tileN * tileK) *
-                          8; // Assume 8 bytes per element for estimation
-  float dataReuse =
-      estimateDataReuse(tileM, tileN, tileK, problemM, problemN, problemK);
-
-  // If tile fits in L1, expect high hit rate
-  float l1FitRatio = params_.l1CacheSizeBytes > 0
-                         ? static_cast<float>(tileSizeBytes) /
-                               static_cast<float>(params_.l1CacheSizeBytes)
-                         : 1.0f;
-  float l2FitRatio = params_.l2CacheSizeBytes > 0
-                         ? static_cast<float>(tileSizeBytes) /
-                               static_cast<float>(params_.l2CacheSizeBytes)
-                         : 1.0f;
-
-  // Base hit rate from cache fit
-  float baseHitRate = 0.0f;
-  if (l1FitRatio < 0.5f) {
-    baseHitRate = 0.9f; // Fits comfortably in L1
-  } else if (l1FitRatio < 1.0f) {
-    baseHitRate = 0.7f; // Fits in L1 but tight
-  } else if (l2FitRatio < 0.5f) {
-    baseHitRate = 0.5f; // Fits in L2
-  } else if (l2FitRatio < 1.0f) {
-    baseHitRate = 0.3f; // Fits in L2 but tight
-  } else {
-    baseHitRate = 0.1f; // Doesn't fit well in cache
+int64_t GPUAnalyticalModel::deriveBlockK(int64_t elementBytes) const {
+  if (elementBytes <= 0) {
+    elementBytes = 2; // FP16 fallback
   }
-
-  // Boost hit rate based on data reuse
-  float reuseBoost = std::min(0.3f, dataReuse * 0.1f);
-  return std::min(1.0f, baseHitRate + reuseBoost);
+  int64_t blockK = params_.cacheLineSizeBytes / elementBytes;
+  // Must be at least as large as the MMA intrinsic K dimension.
+  blockK = std::max(blockK, params_.mmaK);
+  // Round up to the nearest multiple of the intrinsic K so that the
+  // downstream schedule can tile evenly.
+  if (params_.mmaK > 0) {
+    blockK = llvm::alignTo(blockK, params_.mmaK);
+  }
+  return blockK;
 }
 
 //===----------------------------------------------------------------------===//
-// Memory Bandwidth Modeling
+// 2.  Shared-memory footprint modelling
 //===----------------------------------------------------------------------===//
+// For one pipeline stage the LDS stores the A-tile (blockM × blockK) and the
+// B-tile (blockN × blockK).
 
-float GPUAnalyticalModel::computeMemoryBandwidthUtilization(
-    int64_t tileM, int64_t tileN, int64_t tileK, int64_t elementBitwidth,
-    float cacheHitRate) {
-  if (params_.globalMemoryBandwidthTbps <= 0.0f) {
-    return 0.0f;
-  }
-
-  // Estimate bytes transferred per FMA operation
-  // Each FMA requires: 1 element from A, 1 element from B
-  int64_t bytesPerFMA = (elementBitwidth / 8) * 2; // A and B
-  int64_t totalFMAs = tileM * tileN * tileK;
-
-  // Account for cache hits (reduce effective memory traffic)
-  float effectiveBytes =
-      static_cast<float>(totalFMAs * bytesPerFMA) * (1.0f - cacheHitRate);
-
-  // Convert to Tbps (assuming 1 cycle per FMA for bandwidth calculation)
-  // This is a simplified model - actual calculation would need cycle counts
-  float bandwidthRequiredTbps = effectiveBytes * 8.0f / 1e12f; // Simplified
-
-  return bandwidthRequiredTbps / params_.globalMemoryBandwidthTbps;
+int64_t GPUAnalyticalModel::sharedMemPerStage(int64_t blockM, int64_t blockN,
+                                              int64_t blockK,
+                                              int64_t elementBytes) const {
+  return (blockM * blockK + blockN * blockK) * elementBytes;
 }
 
 //===----------------------------------------------------------------------===//
-// Register Pressure Analysis
+// 3.  Pipeline depth (number of K-tiles buffered in LDS)
 //===----------------------------------------------------------------------===//
+// stages = floor(sharedMemorySize / sharedMemPerStage)
+// Clamped to [2, 8] — at least double-buffered, but not so deep that the
+// working set evicts useful data from the L1/L2 hierarchy.
 
-int64_t GPUAnalyticalModel::computeRegisterPressure(int64_t subgroupCount,
-                                                    int64_t tileM,
-                                                    int64_t tileN,
-                                                    int64_t tileK,
-                                                    int64_t elementBitwidth) {
-  // Estimate VGPR usage based on tile sizes
-  // This is a simplified model - actual register allocation is more complex
-  int64_t elementsPerSubgroup = (tileM * tileN) / subgroupCount;
-  int64_t bytesPerSubgroup = elementsPerSubgroup * (elementBitwidth / 8);
-
-  // Rough estimate: each element in registers uses some VGPRs
-  // Assume 4 bytes per VGPR (typical for many GPUs)
-  int64_t estimatedVgprs = bytesPerSubgroup / 4;
-
-  // Add overhead for accumulators, indices, etc.
-  estimatedVgprs += 64; // Base overhead
-
-  return estimatedVgprs * subgroupCount;
-}
-
-float GPUAnalyticalModel::estimateOccupancy(int64_t subgroupCount,
-                                            int64_t tileM, int64_t tileN,
-                                            int64_t tileK,
-                                            int64_t elementBitwidth) {
-  if (params_.maxVgprsPerWorkgroup == 0 || params_.maxWorkgroupsPerWgp == 0) {
-    return 0.5f; // Default occupancy if limits unknown
+int64_t GPUAnalyticalModel::deriveMaxPipelineDepth(int64_t blockM,
+                                                   int64_t blockN,
+                                                   int64_t blockK,
+                                                   int64_t elementBytes) const {
+  int64_t perStage = sharedMemPerStage(blockM, blockN, blockK, elementBytes);
+  if (perStage <= 0 || params_.sharedMemorySizeBytes <= 0) {
+    return 2; // double-buffer minimum
   }
-
-  int64_t vgprUsage = computeRegisterPressure(subgroupCount, tileM, tileN,
-                                              tileK, elementBitwidth);
-  float vgprOccupancy = static_cast<float>(params_.maxVgprsPerWorkgroup) /
-                        static_cast<float>(vgprUsage);
-
-  // Also consider shared memory occupancy
-  int64_t sharedMemUsage =
-      (tileM * tileK + tileN * tileK) * (elementBitwidth / 8);
-  float sharedMemOccupancy =
-      params_.sharedMemorySizeBytes > 0
-          ? static_cast<float>(params_.sharedMemorySizeBytes) /
-                static_cast<float>(sharedMemUsage)
-          : 1.0f;
-
-  // Occupancy is limited by the most constrained resource
-  float occupancy = std::min(vgprOccupancy, sharedMemOccupancy);
-  occupancy =
-      std::min(occupancy, static_cast<float>(params_.maxWorkgroupsPerWgp));
-
-  return std::max(0.0f, std::min(1.0f, occupancy));
-}
-
-//===----------------------------------------------------------------------===//
-// Core Analytical Formulas
-//===----------------------------------------------------------------------===//
-
-int64_t GPUAnalyticalModel::computeOptimalSubgroupCount(
-    int64_t problemM, int64_t problemN, int64_t problemK,
-    int64_t elementBitwidth, bool isGemm, bool scaled) {
-  // Base calculation: consider problem size and arithmetic intensity
-  // Larger problems can benefit from more parallelism
-  int64_t problemSize = problemM * problemN;
-  float problemSizeFactor = 1.0f;
-
-  // Scale based on problem size
-  if (problemSize > 1000000) { // > 1M elements
-    problemSizeFactor = 1.5f;
-  } else if (problemSize > 100000) { // > 100K elements
-    problemSizeFactor = 1.2f;
-  } else if (problemSize < 10000) {  // < 10K elements
-    problemSizeFactor = 0.7f;        // Smaller problems need fewer subgroups
-  } else if (problemSize < 100000) { // 10K-100K elements
-    problemSizeFactor = 0.9f;        // Medium-small problems: slightly reduce
-  }
-
-  // Target occupancy: Choose based on problem characteristics
-  // Rationale for 50-75% range:
-  // - Too low (<50%): Underutilizes GPU, poor latency hiding
-  // - Too high (>75%): Resource contention, register spilling, shared memory
-  // pressure
-  // - 50-75% is a sweet spot that balances parallelism and resource efficiency
-  // - 62.5% (0.625) is the middle point, providing a balanced default
-  //
-  // The value 0.625 was chosen as:
-  // 1. Middle of the 50-75% range mentioned in the plan
-  // 2. A reasonable default that works across different problem sizes
-  // 3. Can be tuned based on performance data (future work)
-  float targetOccupancy = 0.625f; // Default: middle of 50-75% range
-
-  // Adjust based on problem characteristics (can be refined with performance
-  // data) For now, use a simple heuristic: larger problems can use higher
-  // occupancy because they have better arithmetic intensity and can hide
-  // latency better
-  if (problemSize > 1000000) {
-    targetOccupancy = 0.70f; // 70% for very large problems (compute-bound)
-  } else if (problemSize < 10000) {
-    targetOccupancy = 0.55f; // 55% for small problems (memory-bound, need more
-                             // resources per workgroup)
-  }
-
-  int64_t baseSubgroups =
-      params_.maxWorkgroupsPerWgp > 0
-          ? static_cast<int64_t>(params_.maxWorkgroupsPerWgp * targetOccupancy)
-          : 4; // Default
-
-  // Apply problem size factor
-  int64_t maxSubgroups =
-      static_cast<int64_t>(baseSubgroups * problemSizeFactor);
-
-  // Consider WGP count for workgroup distribution
-  if (params_.wgpCount > 0) {
-    // Prefer subgroup counts that distribute well across WGPs
-    // But don't reduce too much for large problems
-    int64_t wgpLimit = params_.wgpCount * 2;
-    if (problemSize > 100000) {
-      // For large problems, allow more subgroups even if it exceeds wgpCount *
-      // 2
-      wgpLimit = std::max(wgpLimit, static_cast<int64_t>(params_.wgpCount * 3));
-    }
-    maxSubgroups = std::min(maxSubgroups, wgpLimit);
-  }
-
-  // For scaled matmuls, prefer more subgroups for parallelism
-  if (scaled) {
-    maxSubgroups = std::max(maxSubgroups, static_cast<int64_t>(8));
-    // For large scaled matmuls, prefer even more
-    if (problemSize > 1000000) {
-      maxSubgroups = std::max(maxSubgroups, static_cast<int64_t>(12));
-    }
-  }
-
-  // For convolutions, favor more subgroups for latency hiding
-  if (!isGemm) {
-    maxSubgroups = std::max(maxSubgroups, static_cast<int64_t>(8));
-  }
-
-  // Clamp to reasonable bounds
+  int64_t stages = params_.sharedMemorySizeBytes / perStage;
   return std::max(static_cast<int64_t>(2),
-                  std::min(maxSubgroups, static_cast<int64_t>(16)));
+                  std::min(stages, static_cast<int64_t>(8)));
 }
 
-int64_t GPUAnalyticalModel::computeOptimalMNTileCount(
-    int64_t problemM, int64_t problemN, int64_t problemK,
-    int64_t elementBitwidth, int64_t subgroupCount, float arithmeticIntensity,
-    bool isGemm, bool scaled) {
-  // Higher for compute-bound (large AI), lower for memory-bound
-  // Arithmetic intensity = ops / bytes
-  float baseTileCount = 4.0f;
+//===----------------------------------------------------------------------===//
+// 4.  Maximum square-ish MN block that fits in LDS
+//===----------------------------------------------------------------------===//
+// Solve for blockMN (assuming square tiles, blockM ≈ blockN ≈ blockMN):
+//
+//   (blockMN + blockMN) * blockK * elementBytes * stages ≤ LDS
+//   blockMN ≤ LDS / (2 * blockK * elementBytes * stages)
+//
+// We round down to the nearest multiple of the MMA intrinsic M/N dimension.
 
-  // Scale based on arithmetic intensity
-  if (arithmeticIntensity > 100.0f) {
-    baseTileCount = 32.0f; // Very compute-bound
-  } else if (arithmeticIntensity > 10.0f) {
-    baseTileCount = 16.0f; // Compute-bound
-  } else if (arithmeticIntensity > 1.0f) {
-    baseTileCount = 8.0f; // Balanced
-  } else {
-    baseTileCount = 4.0f; // Memory-bound
+int64_t GPUAnalyticalModel::deriveMaxBlockMN(int64_t blockK,
+                                             int64_t elementBytes,
+                                             int64_t pipelineDepth) const {
+  if (blockK <= 0 || elementBytes <= 0 || pipelineDepth <= 0 ||
+      params_.sharedMemorySizeBytes <= 0) {
+    return params_.mmaM > 0 ? params_.mmaM * 4 : 64;
   }
-
-  // For scaled matmuls, prefer larger tiles
-  if (scaled) {
-    baseTileCount = std::max(baseTileCount, 32.0f);
+  int64_t maxBlockMN = params_.sharedMemorySizeBytes /
+                       (2 * blockK * elementBytes * pipelineDepth);
+  // Round down to the nearest multiple of the intrinsic.
+  int64_t intrinsicMN = std::max(params_.mmaM, params_.mmaN);
+  if (intrinsicMN > 0 && maxBlockMN >= intrinsicMN) {
+    maxBlockMN = (maxBlockMN / intrinsicMN) * intrinsicMN;
   }
-
-  // Constrain by shared memory capacity
-  int64_t maxTileCount = 64; // Reasonable upper bound
-  if (params_.sharedMemorySizeBytes > 0) {
-    // Estimate max tiles that fit in shared memory
-    // Rough estimate: each tile element needs storage
-    int64_t bytesPerTileElement = elementBitwidth / 8;
-    int64_t estimatedMaxTiles = params_.sharedMemorySizeBytes /
-                                (bytesPerTileElement * 1024); // Rough estimate
-    maxTileCount = std::min(maxTileCount, estimatedMaxTiles);
-  }
-
-  int64_t tileCount = static_cast<int64_t>(baseTileCount);
-  return std::max(static_cast<int64_t>(2), std::min(tileCount, maxTileCount));
+  // At minimum, one intrinsic tile.
+  return std::max(maxBlockMN,
+                  intrinsicMN > 0 ? intrinsicMN : static_cast<int64_t>(16));
 }
 
-int64_t GPUAnalyticalModel::computeOptimalKTileCount(int64_t problemK,
-                                                     int64_t elementBitwidth,
-                                                     int64_t subgroupCount,
-                                                     bool isGemm) {
-  // Balance reduction loop overhead vs. memory access efficiency
-  // For compute-bound: fewer K tiles (less overhead)
-  // For memory-bound: more K tiles (better memory access patterns)
-
-  int64_t baseKTiles = 4;
-
-  // For high K dimensions, prefer fewer K tiles to reduce reduction overhead
-  // This helps with regressions in high-K problems (e.g., k=512)
-  if (problemK > 256) {
-    baseKTiles = 2; // Reduce from 4 to 2 for high K
-  } else if (problemK > 128) {
-    baseKTiles = 3; // Moderate reduction for medium-high K
-  } else if (problemK < 64) {
-    // For very small K, use minimal tiles to avoid overhead
-    baseKTiles = 2;
-  }
-
-  // For convolutions, prefer more K tiles for latency hiding
-  if (!isGemm) {
-    baseKTiles = 4;
-  }
-
-  // Align with cache line sizes for optimal memory access
-  // Prefer multiples that align well with cache lines
-  int64_t cacheLineElements = params_.cacheLineSizeBits / elementBitwidth;
-  if (cacheLineElements > 0) {
-    // Round to nearest multiple of cache line elements
-    baseKTiles = llvm::alignTo(baseKTiles, cacheLineElements);
-  }
-
-  // Ensure K tiles don't exceed problem K dimension
-  if (problemK > 0 && baseKTiles > problemK / 4) {
-    baseKTiles = std::max(static_cast<int64_t>(2), problemK / 4);
-  }
-
-  return std::max(static_cast<int64_t>(2),
-                  std::min(baseKTiles, static_cast<int64_t>(8)));
-}
+//===----------------------------------------------------------------------===//
+// 5.  Register-pressure estimate
+//===----------------------------------------------------------------------===//
+// Each subgroup holds:
+//   - Accumulator:   (mPerSG * nPerSG) elements  (full precision, 32-bit)
+//   - A fragment:    (mPerSG * kIntrinsic)  elements
+//   - B fragment:    (nPerSG * kIntrinsic)  elements
+//   - Overhead:      ~16 VGPRs for indices / predicates / addresses
+//
+// Total VGPRs ≈ (accum_elements * 4 + frag_elements * elementBytes) / 4 + 16
+// (assuming 4 bytes per VGPR).
 
 int64_t
-GPUAnalyticalModel::computeOptimalKElementCount(int64_t elementBitwidth) {
-  // Align to cache line boundaries
-  int64_t cacheLineElements = params_.cacheLineSizeBits / elementBitwidth;
-  if (cacheLineElements <= 0) {
-    cacheLineElements = 16; // Default fallback
-  }
+GPUAnalyticalModel::estimateVgprsPerSubgroup(int64_t mTilesPerSubgroup,
+                                             int64_t nTilesPerSubgroup,
+                                             int64_t elementBytes) const {
+  int64_t mPerSG = mTilesPerSubgroup * params_.mmaM;
+  int64_t nPerSG = nTilesPerSubgroup * params_.mmaN;
 
-  // Use a multiple of cache line size for prefetching and memory coalescing
-  return cacheLineElements * 2; // 2x cache line for better prefetching
+  // Accumulator elements are typically stored in FP32 (4 bytes each),
+  // distributed across the subgroup.
+  int64_t accumElements = mPerSG * nPerSG;
+  int64_t accumVgprs = (accumElements * 4) / (4 * params_.subgroupSize);
+
+  // Input fragments for one K-step (one MMA intrinsic invocation).
+  int64_t fragA = mPerSG * params_.mmaK;
+  int64_t fragB = nPerSG * params_.mmaK;
+  int64_t fragVgprs =
+      ((fragA + fragB) * elementBytes) / (4 * params_.subgroupSize);
+
+  int64_t overhead = 16;
+  return accumVgprs + fragVgprs + overhead;
 }
 
-bool GPUAnalyticalModel::validateSeeds(const GPUMMAHeuristicSeeds &seeds,
-                                       int64_t elementBitwidth,
-                                       int64_t numRhs) {
-  // Validate shared memory usage
-  // Note: Seeds are heuristics (counts/parameters), not actual tile sizes.
-  // The actual shared memory calculation happens in deduceMMASchedule() which
-  // uses the real tile sizes from the computed schedule. Therefore, we use
-  // a very lenient check here - the real validation happens later.
-  // We only reject obviously invalid seeds (e.g., extremely large values).
-  if (params_.sharedMemorySizeBytes > 0) {
-    // Seeds are parameters that will be used to compute actual tile sizes.
-    // A very rough upper bound: assume worst-case scenario where each seed
-    // parameter directly translates to tile elements.
-    // This is intentionally lenient - actual validation is in
-    // deduceMMASchedule.
-    int64_t bytesPerElement = (elementBitwidth + 7) / 8;
-    // Very rough estimate - seeds are not actual tile sizes
-    int64_t estimatedSharedMem =
-        seeds.bestSubgroupCountPerWorkgroup * seeds.bestMNTileCountPerSubgroup *
-        seeds.bestKElementCountPerSubgroup * bytesPerElement * 2; // A and B
-    // Only reject if estimate is clearly way too large (10x the limit)
-    // This allows seeds to pass through - deduceMMASchedule will do real
-    // validation
-    int64_t threshold = params_.sharedMemorySizeBytes * 10;
-    if (estimatedSharedMem > threshold) {
-      LDBG() << "Analytical model: seeds clearly exceed shared memory limit ("
-             << estimatedSharedMem << " > " << threshold
-             << ", limit=" << params_.sharedMemorySizeBytes << ")";
-      return false;
+//===----------------------------------------------------------------------===//
+// 6.  Subgroup count from occupancy model
+//===----------------------------------------------------------------------===//
+// The GPU can run at most `maxWavesPerSimd` waves per SIMD.  Each workgroup
+// occupies `subgroupCount` waves.  The number of concurrent workgroups per
+// SIMD is:
+//
+//   wg_per_simd = floor(maxWavesPerSimd / subgroupCount)
+//
+// Occupancy is limited by three resources:
+//   (a) Waves:   subgroupCount ≤ maxWavesPerSimd
+//   (b) VGPRs:   subgroupCount * vgprs_per_sg ≤ maxVgprsPerSimd
+//   (c) LDS:     shared_mem_per_wg ≤ sharedMemorySize
+//
+// We pick the *largest* subgroup count that satisfies all three, because
+// more subgroups ⇒ more work per workgroup ⇒ less dispatch overhead.
+
+int64_t GPUAnalyticalModel::deriveSubgroupCount(int64_t blockM, int64_t blockN,
+                                                int64_t blockK,
+                                                int64_t elementBytes,
+                                                int64_t pipelineDepth) const {
+  if (params_.mmaM <= 0 || params_.mmaN <= 0) {
+    return 4; // Safe default when intrinsic info is missing
+  }
+
+  // Start from the hardware maximum and work downward.
+  int64_t maxByWaves = params_.maxWavesPerSimd;
+
+  // We want at least 2 workgroups per SIMD for latency hiding, so limit
+  // subgroup count so that 2 WGs can coexist:
+  //   subgroupCount ≤ maxWavesPerSimd / 2
+  int64_t targetConcurrentWGs = 2;
+  int64_t maxForConcurrency = maxByWaves / targetConcurrentWGs;
+  maxForConcurrency = std::max(maxForConcurrency, static_cast<int64_t>(1));
+
+  // Try subgroup counts from maxForConcurrency down to 1 and pick the
+  // first that fits in the VGPR budget.
+  for (int64_t sg = maxForConcurrency; sg >= 1; --sg) {
+    // Distribute blockM × blockN across `sg` subgroups.
+    // Simplification: assume roughly equal split along the larger dimension.
+    int64_t mTilesTotal =
+        std::max(blockM / params_.mmaM, static_cast<int64_t>(1));
+    int64_t nTilesTotal =
+        std::max(blockN / params_.mmaN, static_cast<int64_t>(1));
+    int64_t totalTiles = mTilesTotal * nTilesTotal;
+    int64_t tilesPerSG = std::max(totalTiles / sg, static_cast<int64_t>(1));
+
+    // Approximate split: sqrt(tilesPerSG) along each dimension.
+    int64_t sqrtTiles =
+        static_cast<int64_t>(std::sqrt(static_cast<double>(tilesPerSG)));
+    sqrtTiles = std::max(sqrtTiles, static_cast<int64_t>(1));
+    int64_t mTilesPerSG = sqrtTiles;
+    int64_t nTilesPerSG =
+        std::max(tilesPerSG / sqrtTiles, static_cast<int64_t>(1));
+
+    int64_t vgprsPerSG =
+        estimateVgprsPerSubgroup(mTilesPerSG, nTilesPerSG, elementBytes);
+
+    // Check VGPR budget: all subgroups in a workgroup share the VGPR file.
+    // Actually, each wave has its own VGPRs.  The constraint is per-wave.
+    if (vgprsPerSG <= params_.maxVgprsPerSimd) {
+      return sg;
     }
   }
 
-  // Validate register limits (very lenient - seeds are heuristics, not final
-  // sizes)
-  if (params_.maxVgprsPerWorkgroup > 0) {
-    // Estimate actual tile sizes from counts for validation
-    int64_t typicalM = params_.typicalMmaM > 0 ? params_.typicalMmaM : 16;
-    int64_t typicalN = params_.typicalMmaN > 0 ? params_.typicalMmaN : 16;
-    int64_t estimatedTileM = seeds.bestMNTileCountPerSubgroup * typicalM;
-    int64_t estimatedTileN = seeds.bestMNTileCountPerSubgroup * typicalN;
-    int64_t estimatedTileK = seeds.bestKElementCountPerSubgroup;
-
-    int64_t estimatedVgprs = computeRegisterPressure(
-        seeds.bestSubgroupCountPerWorkgroup, estimatedTileM, estimatedTileN,
-        estimatedTileK, elementBitwidth);
-
-    // Use very lenient threshold (10x) since this is a rough estimate
-    if (estimatedVgprs > params_.maxVgprsPerWorkgroup * 10) {
-      LDBG() << "Analytical model: seeds clearly exceed VGPR limit ("
-             << estimatedVgprs << " > " << (params_.maxVgprsPerWorkgroup * 10)
-             << ", limit=" << params_.maxVgprsPerWorkgroup << ")";
-      return false;
-    }
-  }
-
-  // Basic sanity checks
-  if (seeds.bestSubgroupCountPerWorkgroup <= 0 ||
-      seeds.bestMNTileCountPerSubgroup <= 0 ||
-      seeds.bestKTileCountPerSubgroup <= 0 ||
-      seeds.bestKElementCountPerSubgroup <= 0) {
-    LDBG() << "Analytical model: seeds have invalid values";
-    return false;
-  }
-
-  return true;
+  return 1;
 }
+
+//===----------------------------------------------------------------------===//
+// 7.  Convert block sizes → GPUMMAHeuristicSeeds
+//===----------------------------------------------------------------------===//
+// The seeds that `deduceMMASchedule` expects are:
+//
+//   bestSubgroupCountPerWorkgroup  – number of subgroups (waves) per WG
+//   bestMNTileCountPerSubgroup     – MMA-intrinsic tiles per SG in M*N
+//   bestKTileCountPerSubgroup      – MMA-intrinsic tiles per SG in K
+//   bestKElementCountPerSubgroup   – total K-elements per SG (= kTiles * mmaK)
+//
+// We derive them from the analytically computed block sizes.
+
+GPUMMAHeuristicSeeds
+GPUAnalyticalModel::blockSizesToSeeds(int64_t blockM, int64_t blockN,
+                                      int64_t blockK, int64_t subgroups,
+                                      int64_t pipelineDepth) const {
+  int64_t mmaM = std::max(params_.mmaM, static_cast<int64_t>(1));
+  int64_t mmaN = std::max(params_.mmaN, static_cast<int64_t>(1));
+  (void)params_.mmaK; // mmaK used only via blockK
+
+  // MN tiles across the entire workgroup.
+  int64_t mTilesTotal = std::max(blockM / mmaM, static_cast<int64_t>(1));
+  int64_t nTilesTotal = std::max(blockN / mmaN, static_cast<int64_t>(1));
+  int64_t totalMNTiles = mTilesTotal * nTilesTotal;
+
+  // Distribute across subgroups.
+  int64_t mnTilesPerSubgroup =
+      std::max(totalMNTiles / subgroups, static_cast<int64_t>(1));
+
+  // K tiles per subgroup (pipeline depth).
+  int64_t kTilesPerSubgroup = pipelineDepth;
+
+  // K elements (= blockK, which is already a multiple of mmaK).
+  int64_t kElements = blockK;
+
+  GPUMMAHeuristicSeeds seeds;
+  seeds.bestSubgroupCountPerWorkgroup = subgroups;
+  seeds.bestMNTileCountPerSubgroup = mnTilesPerSubgroup;
+  seeds.bestKTileCountPerSubgroup = kTilesPerSubgroup;
+  seeds.bestKElementCountPerSubgroup = kElements;
+  return seeds;
+}
+
+//===----------------------------------------------------------------------===//
+// 8.  Top-level entry point
+//===----------------------------------------------------------------------===//
 
 std::optional<GPUMMAHeuristicSeeds>
 GPUAnalyticalModel::computeOptimalSeeds(const GPUMatmulShapeType &problem,
                                         bool isGemm, bool scaled) {
-  LDBG() << "Analytical model: computing seeds for problem M="
-         << llvm::product_of(problem.mSizes)
-         << " N=" << llvm::product_of(problem.nSizes)
-         << " K=" << llvm::product_of(problem.kSizes)
-         << " gemmSize=" << problem.gemmSize;
-
   int64_t problemM = llvm::product_of(problem.mSizes);
   int64_t problemN = llvm::product_of(problem.nSizes);
   int64_t problemK = llvm::product_of(problem.kSizes);
   int64_t elementBitwidth = problem.aType.getIntOrFloatBitWidth();
+  int64_t elementBytes = (elementBitwidth + 7) / 8;
 
-  // Validate problem dimensions
-  if (problemM <= 0) {
-    problemM = 1;
+  LDBG() << "=== tritonBLAS-style analytical model ===";
+  LDBG() << "Problem: M=" << problemM << " N=" << problemN << " K=" << problemK
+         << " elementBits=" << elementBitwidth;
+  LDBG() << "Hardware: LDS=" << params_.sharedMemorySizeBytes
+         << "B, cacheLine=" << params_.cacheLineSizeBytes
+         << "B, MMA=" << params_.mmaM << "x" << params_.mmaN << "x"
+         << params_.mmaK << ", subgroupSize=" << params_.subgroupSize
+         << ", maxVGPR=" << params_.maxVgprsPerSimd
+         << ", maxWaves=" << params_.maxWavesPerSimd;
+
+  // Sanity: bail out if we have no useful hardware info.
+  if (params_.sharedMemorySizeBytes <= 0 && params_.mmaM <= 0) {
+    LDBG() << "Insufficient hardware info, returning nullopt";
+    return std::nullopt;
   }
-  if (problemN <= 0) {
-    problemN = 1;
-  }
-  if (problemK <= 0) {
-    problemK = 1;
-  }
-  if (elementBitwidth <= 0) {
-    elementBitwidth = 16;
-  }
 
-  // Detect problem characteristics for special handling
-  int64_t problemSize = problemM * problemN;
-  bool isSmallProblem = (problemSize < 100000) || (problemK < 256);
-  bool isBatched = (problem.mSizes.size() > 1) || (problem.nSizes.size() > 1) ||
-                   (problem.kSizes.size() > 1) ||
-                   (problem.batchSizes.size() > 0);
+  // --- Step 1: Derive BLOCK_K from cache-line width ---
+  int64_t blockK = deriveBlockK(elementBytes);
+  LDBG() << "Step 1  BLOCK_K = " << blockK
+         << "  (cacheLine=" << params_.cacheLineSizeBytes
+         << " / elemBytes=" << elementBytes << ")";
 
-  LDBG() << "Analytical model: problem characteristics - size=" << problemSize
-         << ", K=" << problemK << ", isSmall=" << isSmallProblem
-         << ", isBatched=" << isBatched;
+  // --- Step 2: Derive initial BLOCK_M, BLOCK_N from LDS capacity ---
+  // Start with a target pipeline depth of 2 (double-buffering) to get the
+  // maximum possible MN block, then adjust.
+  int64_t initialDepth = 2;
+  int64_t maxBlockMN = deriveMaxBlockMN(blockK, elementBytes, initialDepth);
 
-  // Use analytical model formulas directly instead of hardcoded gemmSize
-  // replication This allows the model to adapt to problem characteristics
-  // automatically
+  // Choose blockM and blockN proportional to the problem aspect ratio,
+  // but rounded to intrinsic multiples.
+  int64_t mmaM = std::max(params_.mmaM, static_cast<int64_t>(1));
+  int64_t mmaN = std::max(params_.mmaN, static_cast<int64_t>(1));
 
-  // Compute arithmetic intensity for tile sizing decisions
-  // Arithmetic intensity = ops / bytes = (M * N * K) / (K * (M + N) *
-  // bytes_per_element) Simplified: (M * N) / ((M + N) * bytes_per_element)
-  int64_t bytesPerElement = (elementBitwidth + 7) / 8; // Round up
-  float arithmeticIntensity = 0.0f;
-  if (problemM > 0 && problemN > 0 && bytesPerElement > 0) {
-    int64_t totalOps = problemM * problemN * problemK;
-    int64_t totalBytes =
-        (problemM * problemK + problemN * problemK) * bytesPerElement;
-    if (totalBytes > 0) {
-      arithmeticIntensity =
-          static_cast<float>(totalOps) / static_cast<float>(totalBytes);
+  // Compute how many intrinsic tiles fit in the MN budget.
+  // Budget: blockM * blockK + blockN * blockK ≤ LDS / (elemBytes * stages)
+  // With blockM ≈ blockN ≈ maxBlockMN, solve for each independently.
+  // Use aspect ratio to distribute: if M >> N, give more to M.
+  double aspectRatio =
+      (problemN > 0) ? static_cast<double>(problemM) / problemN : 1.0;
+  // Clamp aspect ratio to avoid extreme skew.
+  aspectRatio = std::max(0.25, std::min(aspectRatio, 4.0));
+
+  // blockM + blockN ≈ 2 * maxBlockMN (total budget for both)
+  // Distribute: blockM = maxBlockMN * sqrt(aspect), blockN = maxBlockMN /
+  // sqrt(aspect)
+  double sqrtAspect = std::sqrt(aspectRatio);
+  int64_t blockM = static_cast<int64_t>(maxBlockMN * sqrtAspect);
+  int64_t blockN = static_cast<int64_t>(maxBlockMN / sqrtAspect);
+
+  // Round to intrinsic multiples.
+  blockM = std::max((blockM / mmaM) * mmaM, mmaM);
+  blockN = std::max((blockN / mmaN) * mmaN, mmaN);
+
+  // Clamp to problem size — no point tiling larger than the problem.
+  blockM =
+      std::min(blockM, static_cast<int64_t>(llvm::alignTo(problemM, mmaM)));
+  blockN =
+      std::min(blockN, static_cast<int64_t>(llvm::alignTo(problemN, mmaN)));
+
+  LDBG() << "Step 2  initial BLOCK_M=" << blockM << " BLOCK_N=" << blockN
+         << "  (maxBlockMN=" << maxBlockMN << ", aspect=" << aspectRatio << ")";
+
+  // --- Step 3: Derive pipeline depth for chosen block sizes ---
+  int64_t pipelineDepth =
+      deriveMaxPipelineDepth(blockM, blockN, blockK, elementBytes);
+  LDBG() << "Step 3  pipeline depth = " << pipelineDepth;
+
+  // --- Step 4: Verify LDS fits, reduce block if needed ---
+  // Iteratively reduce block sizes until the working set fits in LDS.
+  while (sharedMemPerStage(blockM, blockN, blockK, elementBytes) *
+             pipelineDepth >
+         params_.sharedMemorySizeBytes) {
+    if (blockM > blockN && blockM > mmaM) {
+      blockM -= mmaM;
+    } else if (blockN > mmaN) {
+      blockN -= mmaN;
+    } else if (pipelineDepth > 2) {
+      --pipelineDepth;
+    } else {
+      break;
     }
   }
-  // Fallback for edge cases
-  if (arithmeticIntensity <= 0.0f) {
-    arithmeticIntensity = 10.0f; // Default to compute-bound assumption
-  }
+  // Ensure minimums.
+  blockM = std::max(blockM, mmaM);
+  blockN = std::max(blockN, mmaN);
 
-  // Use analytical formulas to compute optimal seeds
-  int64_t subgroupCount = computeOptimalSubgroupCount(
-      problemM, problemN, problemK, elementBitwidth, isGemm, scaled);
+  LDBG() << "Step 4  adjusted BLOCK_M=" << blockM << " BLOCK_N=" << blockN
+         << " depth=" << pipelineDepth << " LDS_used="
+         << sharedMemPerStage(blockM, blockN, blockK, elementBytes) *
+                pipelineDepth;
 
-  int64_t mnTileCount = computeOptimalMNTileCount(
-      problemM, problemN, problemK, elementBitwidth, subgroupCount,
-      arithmeticIntensity, isGemm, scaled);
+  // --- Step 5: Derive subgroup count from occupancy model ---
+  int64_t subgroups =
+      deriveSubgroupCount(blockM, blockN, blockK, elementBytes, pipelineDepth);
+  LDBG() << "Step 5  subgroups = " << subgroups;
 
-  int64_t kTileCount = computeOptimalKTileCount(problemK, elementBitwidth,
-                                                subgroupCount, isGemm);
+  // --- Step 6: Convert to seeds ---
+  GPUMMAHeuristicSeeds seeds =
+      blockSizesToSeeds(blockM, blockN, blockK, subgroups, pipelineDepth);
 
-  int64_t kElementCount = computeOptimalKElementCount(elementBitwidth);
+  // Ensure all seeds are at least 1 to avoid assertion failures downstream.
+  seeds.bestSubgroupCountPerWorkgroup =
+      std::max(seeds.bestSubgroupCountPerWorkgroup, static_cast<int64_t>(1));
+  seeds.bestMNTileCountPerSubgroup =
+      std::max(seeds.bestMNTileCountPerSubgroup, static_cast<int64_t>(1));
+  seeds.bestKTileCountPerSubgroup =
+      std::max(seeds.bestKTileCountPerSubgroup, static_cast<int64_t>(2));
+  seeds.bestKElementCountPerSubgroup =
+      std::max(seeds.bestKElementCountPerSubgroup, static_cast<int64_t>(1));
 
-  // Apply special handling for small problems
-  if (isSmallProblem) {
-    LDBG() << "Analytical model: applying small problem optimizations";
-    // For small problems, use more conservative seeds
-    // Reduce subgroup count to avoid overhead
-    subgroupCount = std::min(subgroupCount, static_cast<int64_t>(4));
-    // Reduce tile sizes to better match problem size
-    mnTileCount = std::min(mnTileCount, static_cast<int64_t>(8));
-    // For very small K, reduce K tiles
-    if (problemK < 128) {
-      kTileCount = std::min(kTileCount, static_cast<int64_t>(2));
-    }
-  }
-
-  // Apply special handling for batched matmuls
-  if (isBatched) {
-    LDBG() << "Analytical model: applying batched matmul optimizations";
-    // For batched ops, prefer fewer subgroups to reduce coordination overhead
-    subgroupCount = std::min(subgroupCount, static_cast<int64_t>(4));
-    // But prefer larger tiles to amortize overhead
-    mnTileCount = std::max(mnTileCount, static_cast<int64_t>(8));
-  }
-
-  // Add lower bounds: ensure seeds don't exceed problem size constraints
-  // Subgroup count should be reasonable (already clamped to 2-16)
-  // MN tile count should not exceed problem dimensions
-  int64_t maxMNTiles = std::max(problemM, problemN) / 16; // Rough estimate
-  if (maxMNTiles > 0) {
-    mnTileCount = std::min(mnTileCount, maxMNTiles);
-  }
-  // K tile count should not exceed K dimension
-  if (problemK > 0) {
-    kTileCount = std::min(kTileCount, problemK / 8); // Rough estimate
-  }
-  // Ensure minimum values
-  mnTileCount = std::max(mnTileCount, static_cast<int64_t>(2));
-  kTileCount = std::max(kTileCount, static_cast<int64_t>(2));
-
-  // Ensure all computed values are valid
-  if (subgroupCount <= 0) {
-    subgroupCount = 2;
-  }
-  if (mnTileCount <= 0) {
-    mnTileCount = 2;
-  }
-  if (kTileCount <= 0) {
-    kTileCount = 2;
-  }
-  if (kElementCount <= 0) {
-    kElementCount = 8;
-  }
-
-  GPUMMAHeuristicSeeds seeds;
-  seeds.bestSubgroupCountPerWorkgroup = subgroupCount;
-  seeds.bestMNTileCountPerSubgroup = mnTileCount;
-  seeds.bestKTileCountPerSubgroup = kTileCount;
-  seeds.bestKElementCountPerSubgroup = kElementCount;
-
-  // Validation is lenient - let deduceMMASchedule do the real validation
-  // Always return seeds to avoid breaking compilation
-  if (!validateSeeds(seeds, elementBitwidth, problem.numHorizontallyFusedOps)) {
-    LDBG() << "Analytical model: validation failed but returning seeds anyway "
-              "(lenient validation)";
-    // Still return seeds - let deduceMMASchedule do the real validation
-  }
-
-  LDBG() << "Analytical model: computed seeds - subgroups=" << subgroupCount
-         << ", MN tiles=" << mnTileCount << ", K tiles=" << kTileCount
-         << ", K elements=" << kElementCount;
+  LDBG() << "=== Analytical seeds: subgroups="
+         << seeds.bestSubgroupCountPerWorkgroup
+         << ", MN_tiles=" << seeds.bestMNTileCountPerSubgroup
+         << ", K_tiles=" << seeds.bestKTileCountPerSubgroup
+         << ", K_elems=" << seeds.bestKElementCountPerSubgroup << " ===";
 
   return seeds;
 }

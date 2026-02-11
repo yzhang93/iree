@@ -12,105 +12,109 @@
 
 namespace mlir::iree_compiler {
 
-/// Architectural parameters that characterize GPU hardware capabilities.
+/// Architectural parameters extracted from the GPU target description.
+/// These are the *only* inputs to the analytical model — all decisions
+/// are derived from these hardware quantities plus the problem shape.
 struct GPUArchitecturalParams {
-  // Cache sizes (in bytes)
-  int64_t l1CacheSizeBytes = 0;
-  int64_t l2CacheSizeBytes = 0;
-  int64_t sharedMemorySizeBytes = 0;
+  // --- Memory hierarchy ---
+  int64_t sharedMemorySizeBytes = 0; // LDS per workgroup (bytes)
+  int64_t cacheLineSizeBytes = 128;  // Global memory cache line (bytes)
 
-  // Memory bandwidths (in Tbps - Terabits per second)
-  float globalMemoryBandwidthTbps = 0.0f;
-  float sharedMemoryBandwidthTbps = 0.0f;
+  // --- Memory bandwidth ---
+  float globalMemoryBandwidthGBps = 0.0f; // GB/s
 
-  // Peak compute throughput (TFLOPS per bitwidth)
+  // --- Compute throughput ---
+  // Peak TFLOPS for each element bitwidth (e.g., 16 → FP16 peak TFLOPS).
   llvm::DenseMap<int64_t, float> peakTflopsPerBitwidth;
 
-  // Register limits
-  int64_t maxVgprsPerWorkgroup = 0;
-  int64_t maxSgprsPerWorkgroup = 0;
+  // --- Register file ---
+  int64_t maxVgprsPerSimd = 256; // VGPRs per SIMD unit
+  int64_t numSimdsPerWgp = 4;    // SIMD units (CUs) per WGP
+  int64_t maxWavesPerSimd = 10;  // Max concurrent waves per SIMD
 
-  // Subgroup and workgroup parameters
-  int64_t subgroupSize = 0;
-  int64_t wgpCount = 0;
-  int64_t maxWorkgroupsPerWgp = 0;
+  // --- Workgroup / subgroup ---
+  int64_t subgroupSize = 64; // Threads per wave/subgroup
+  int64_t wgpCount = 0;      // Number of WGPs (Workgroup Processors)
 
-  // Matrix core dimensions (typical intrinsic shapes)
-  int64_t typicalMmaM = 0;
-  int64_t typicalMmaN = 0;
-  int64_t typicalMmaK = 0;
-
-  // Cache line size (in bits)
-  int64_t cacheLineSizeBits = 128 * 8; // Default: 128 bytes
+  // --- MMA intrinsic shape (from the target's first available intrinsic) ---
+  int64_t mmaM = 16;
+  int64_t mmaN = 16;
+  int64_t mmaK = 16;
 
   GPUArchitecturalParams() = default;
 };
 
-/// Analytical performance model for computing optimal MMA heuristic seeds.
-/// Inspired by tritonBLAS approach to model cache hierarchy, memory bandwidth,
-/// compute throughput, and register pressure.
+/// tritonBLAS-style analytical model for GPU GEMM configuration.
+///
+/// Instead of using fixed heuristic thresholds, all parameters are derived
+/// from hardware specifications and the problem shape using closed-form
+/// equations.  The model follows the approach described in the tritonBLAS
+/// paper (arXiv:2512.04226):
+///
+///   1. Derive BLOCK_K from cache-line width and element size so that every
+///      global memory transaction is fully utilised.
+///   2. Derive BLOCK_M/BLOCK_N from the shared-memory capacity so that the
+///      working-set (A-tile + B-tile) fits in LDS for a given pipeline depth.
+///   3. Derive the subgroup (warp) count from an occupancy model that balances
+///      register pressure and shared-memory usage against hardware limits.
+///   4. Derive the pipeline depth (K-tile count) by dividing the available
+///      LDS budget by the per-stage shared-memory footprint.
+///
+/// The model produces `GPUMMAHeuristicSeeds` that can be consumed by the
+/// existing `deduceMMASchedule` infrastructure.
 class GPUAnalyticalModel {
 public:
   GPUAnalyticalModel(const GPUArchitecturalParams &params) : params_(params) {}
 
-  /// Main entry point: compute optimal seeds for a given problem.
-  /// Returns std::nullopt if the model cannot compute valid seeds.
+  /// Compute optimal seeds derived purely from hardware parameters and the
+  /// problem shape.  Returns std::nullopt only when hardware parameters are
+  /// insufficient (all zeros).
   std::optional<GPUMMAHeuristicSeeds>
   computeOptimalSeeds(const GPUMatmulShapeType &problem, bool isGemm,
                       bool scaled);
 
 private:
-  /// Estimate cache hit rate based on tile sizes and problem dimensions.
-  /// Returns a value between 0.0 (no hits) and 1.0 (all hits).
-  float estimateCacheHitRate(int64_t tileM, int64_t tileN, int64_t tileK,
-                             int64_t problemM, int64_t problemN,
-                             int64_t problemK);
+  // ---------- Derived quantities (no magic constants) ----------
 
-  /// Compute memory bandwidth utilization for given tile sizes.
-  /// Returns utilization as a fraction (0.0 to 1.0+).
-  float computeMemoryBandwidthUtilization(int64_t tileM, int64_t tileN,
-                                          int64_t tileK,
-                                          int64_t elementBitwidth,
-                                          float cacheHitRate);
+  /// BLOCK_K: number of K-elements that fills one cache line.
+  ///   = cacheLineBytes / elementBytes
+  int64_t deriveBlockK(int64_t elementBytes) const;
 
-  /// Estimate workgroup occupancy based on register pressure and shared memory.
-  /// Returns occupancy as a fraction (0.0 to 1.0).
-  float estimateOccupancy(int64_t subgroupCount, int64_t tileM, int64_t tileN,
-                          int64_t tileK, int64_t elementBitwidth);
+  /// Per-stage shared-memory footprint in bytes for a given tile.
+  ///   = (blockM * blockK + blockN * blockK) * elementBytes
+  int64_t sharedMemPerStage(int64_t blockM, int64_t blockN, int64_t blockK,
+                            int64_t elementBytes) const;
 
-  /// Compute register pressure (VGPR usage) for given tile sizes.
-  /// Returns estimated VGPR count per workgroup.
-  int64_t computeRegisterPressure(int64_t subgroupCount, int64_t tileM,
-                                  int64_t tileN, int64_t tileK,
-                                  int64_t elementBitwidth);
+  /// Maximum pipeline depth (stages) that fit in shared memory.
+  ///   = floor(sharedMemorySize / sharedMemPerStage)
+  int64_t deriveMaxPipelineDepth(int64_t blockM, int64_t blockN, int64_t blockK,
+                                 int64_t elementBytes) const;
 
-  /// Estimate data reuse factor for cache modeling.
-  /// Higher values indicate more temporal/spatial locality.
-  float estimateDataReuse(int64_t tileM, int64_t tileN, int64_t tileK,
-                          int64_t problemM, int64_t problemN, int64_t problemK);
+  /// Maximum square-ish MN block size that fits in shared memory for a given
+  /// pipeline depth and BLOCK_K.
+  ///   Solve: (blockMN + blockMN) * blockK * elementBytes * stages <= LDS
+  ///   =>     blockMN <= LDS / (2 * blockK * elementBytes * stages)
+  int64_t deriveMaxBlockMN(int64_t blockK, int64_t elementBytes,
+                           int64_t pipelineDepth) const;
 
-  /// Compute optimal subgroup count per workgroup.
-  int64_t computeOptimalSubgroupCount(int64_t problemM, int64_t problemN,
-                                      int64_t problemK, int64_t elementBitwidth,
-                                      bool isGemm, bool scaled);
+  /// Estimate VGPRs consumed per subgroup for a given tile.
+  ///   Each subgroup holds an accumulator tile of size
+  ///   (mTile * mmaM) * (nTile * mmaN) elements, stored in registers.
+  ///   Plus input fragments and index overhead.
+  int64_t estimateVgprsPerSubgroup(int64_t mTilesPerSubgroup,
+                                   int64_t nTilesPerSubgroup,
+                                   int64_t elementBytes) const;
 
-  /// Compute optimal M/N tile count per subgroup.
-  int64_t computeOptimalMNTileCount(int64_t problemM, int64_t problemN,
-                                    int64_t problemK, int64_t elementBitwidth,
-                                    int64_t subgroupCount,
-                                    float arithmeticIntensity, bool isGemm,
-                                    bool scaled);
+  /// Derive subgroup count from occupancy constraints.
+  ///   Target: maximise waves in flight while keeping VGPRs and LDS in budget.
+  int64_t deriveSubgroupCount(int64_t blockM, int64_t blockN, int64_t blockK,
+                              int64_t elementBytes,
+                              int64_t pipelineDepth) const;
 
-  /// Compute optimal K tile count per subgroup.
-  int64_t computeOptimalKTileCount(int64_t problemK, int64_t elementBitwidth,
-                                   int64_t subgroupCount, bool isGemm);
-
-  /// Compute optimal K element count per subgroup.
-  int64_t computeOptimalKElementCount(int64_t elementBitwidth);
-
-  /// Validate computed seeds against hardware limits.
-  bool validateSeeds(const GPUMMAHeuristicSeeds &seeds, int64_t elementBitwidth,
-                     int64_t numRhs = 1);
+  /// Convert block sizes to seed values that deduceMMASchedule expects.
+  GPUMMAHeuristicSeeds blockSizesToSeeds(int64_t blockM, int64_t blockN,
+                                         int64_t blockK, int64_t subgroups,
+                                         int64_t pipelineDepth) const;
 
   GPUArchitecturalParams params_;
 };
