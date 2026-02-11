@@ -6,7 +6,7 @@
 
 #include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
 
-#include "iree/compiler/Codegen/Common/GPU/GPUHeuristics.h"
+#include "iree/compiler/Codegen/Common/GPU/GPUAnalyticalModel.h"
 #include "iree/compiler/Codegen/Common/TileInferenceUtils.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
@@ -39,6 +39,12 @@ static llvm::cl::opt<bool> clGPUTestCpromotion(
     llvm::cl::desc("C promote in specific case of elemetwise operations that "
                    "codegen cant yet support without it if also doing padding"),
     llvm::cl::init(true));
+
+static llvm::cl::opt<bool> clUseAnalyticalModel(
+    "iree-codegen-use-analytical-mma-seeds",
+    llvm::cl::desc(
+        "Use analytical model instead of hardcoded seeds for MMA heuristics"),
+    llvm::cl::init(false));
 
 namespace mlir::iree_compiler::IREE::GPU {
 
@@ -321,9 +327,171 @@ getConvolutionHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth) {
   }
 }
 
+/// Extract architectural parameters from TargetAttr for analytical model.
+static GPUArchitecturalParams
+extractArchitecturalParams(IREE::GPU::TargetAttr target) {
+  GPUArchitecturalParams params;
+
+  // Extract from TargetChipAttr
+  if (TargetChipAttr chip = target.getChip()) {
+    // Memory bandwidth
+    if (FloatAttr memoryBandwidthAttr = chip.getMemoryBandwidthTbps()) {
+      params.globalMemoryBandwidthTbps =
+          memoryBandwidthAttr.getValue().convertToFloat();
+    }
+
+    // Peak TFLOPS per bitwidth
+    if (DictionaryAttr peakPerfTflopsAttr = chip.getPerfTflops()) {
+      for (NamedAttribute namedAttr : peakPerfTflopsAttr) {
+        StringRef bitwidthStr = namedAttr.getName().strref();
+        auto floatAttr = dyn_cast<FloatAttr>(namedAttr.getValue());
+        if (!floatAttr) {
+          continue;
+        }
+
+        std::optional<ComputeBitwidths> bitwidth =
+            symbolizeComputeBitwidths(bitwidthStr);
+        if (!bitwidth) {
+          continue;
+        }
+
+        // Convert ComputeBitwidths enum to int64_t bitwidth
+        int64_t bitwidthValue = 0;
+        switch (*bitwidth) {
+        case ComputeBitwidths::FP64:
+        case ComputeBitwidths::Int64:
+          bitwidthValue = 64;
+          break;
+        case ComputeBitwidths::FP32:
+        case ComputeBitwidths::Int32:
+          bitwidthValue = 32;
+          break;
+        case ComputeBitwidths::FP16:
+        case ComputeBitwidths::Int16:
+          bitwidthValue = 16;
+          break;
+        case ComputeBitwidths::FP8:
+        case ComputeBitwidths::Int8:
+          bitwidthValue = 8;
+          break;
+        case ComputeBitwidths::FP6:
+          bitwidthValue = 6;
+          break;
+        case ComputeBitwidths::FP4:
+          bitwidthValue = 4;
+          break;
+        }
+        if (bitwidthValue > 0) {
+          params.peakTflopsPerBitwidth[bitwidthValue] =
+              floatAttr.getValue().convertToFloat();
+        }
+      }
+    }
+
+    // WGP count
+    params.wgpCount = chip.getWgpCount();
+  }
+
+  // Extract from TargetWgpAttr
+  TargetWgpAttr wgp = target.getWgp();
+  params.sharedMemorySizeBytes = wgp.getMaxWorkgroupMemoryBytes();
+  params.subgroupSize = target.getPreferredSubgroupSize();
+
+  // Try to extract typical MMA dimensions from available intrinsics
+  // Use the first available MMA intrinsic as a reference
+  if (!wgp.getMma().empty()) {
+    IREE::GPU::MMAAttr firstMma = wgp.getMma()[0];
+    auto [mSize, nSize, kSize] = firstMma.getMNKShape();
+    params.typicalMmaM = mSize;
+    params.typicalMmaN = nSize;
+    params.typicalMmaK = kSize;
+  } else if (!wgp.getScaledMma().empty()) {
+    IREE::GPU::ScaledMMAAttr firstSMMA = wgp.getScaledMma()[0];
+    auto [m, n, k, kB] = firstSMMA.getScaledMNKShape();
+    params.typicalMmaM = m;
+    params.typicalMmaN = n;
+    params.typicalMmaK = k;
+  }
+
+  // Set defaults/estimates for missing parameters
+  if (params.l1CacheSizeBytes == 0) {
+    // Default L1 cache estimate (varies by architecture)
+    params.l1CacheSizeBytes = 16 * 1024; // 16 KB default
+    LDBG() << "Using default L1 cache size: " << params.l1CacheSizeBytes;
+  }
+  if (params.l2CacheSizeBytes == 0) {
+    // Default L2 cache estimate
+    params.l2CacheSizeBytes = 1024 * 1024; // 1 MB default
+    LDBG() << "Using default L2 cache size: " << params.l2CacheSizeBytes;
+  }
+  if (params.sharedMemoryBandwidthTbps == 0.0f) {
+    // Estimate shared memory bandwidth (typically much higher than global)
+    params.sharedMemoryBandwidthTbps = params.globalMemoryBandwidthTbps * 10.0f;
+    LDBG() << "Using estimated shared memory bandwidth: "
+           << params.sharedMemoryBandwidthTbps;
+  }
+  if (params.maxWorkgroupsPerWgp == 0) {
+    // Default estimate for max workgroups per WGP
+    params.maxWorkgroupsPerWgp = 16;
+    LDBG() << "Using default max workgroups per WGP: "
+           << params.maxWorkgroupsPerWgp;
+  }
+  if (params.maxVgprsPerWorkgroup == 0) {
+    // Default VGPR limit (varies by architecture)
+    params.maxVgprsPerWorkgroup = 256 * 64; // Typical limit
+    LDBG() << "Using default max VGPRs per workgroup: "
+           << params.maxVgprsPerWorkgroup;
+  }
+
+  params.cacheLineSizeBits = kCacheLineSizeBits;
+
+  return params;
+}
+
 static std::optional<GPUMMAHeuristicSeeds>
 getContractionHeuristicSeeds(GPUMatmulShapeType problem, bool isGemm,
-                             bool scaled) {
+                             bool scaled,
+                             IREE::GPU::TargetAttr target = nullptr) {
+  // Try analytical model if flag is enabled and target is available
+  if (clUseAnalyticalModel && target) {
+    GPUArchitecturalParams params = extractArchitecturalParams(target);
+    GPUAnalyticalModel model(params);
+    std::optional<GPUMMAHeuristicSeeds> analyticalSeeds =
+        model.computeOptimalSeeds(problem, isGemm, scaled);
+
+    if (analyticalSeeds) {
+      // Log comparison with hardcoded seeds for debugging
+      GemmSize gemmSize = problem.gemmSize;
+      int64_t inBitWidth = problem.aType.getIntOrFloatBitWidth();
+      std::optional<GPUMMAHeuristicSeeds> hardcodedSeeds;
+      if (isGemm) {
+        hardcodedSeeds = getGemmHeuristicSeeds(gemmSize, inBitWidth, scaled);
+      } else {
+        hardcodedSeeds = getConvolutionHeuristicSeeds(gemmSize, inBitWidth);
+      }
+
+      if (hardcodedSeeds) {
+        LDBG() << "Analytical model seeds: subgroups="
+               << analyticalSeeds->bestSubgroupCountPerWorkgroup
+               << ", MN tiles=" << analyticalSeeds->bestMNTileCountPerSubgroup
+               << ", K tiles=" << analyticalSeeds->bestKTileCountPerSubgroup
+               << ", K elements="
+               << analyticalSeeds->bestKElementCountPerSubgroup;
+        LDBG() << "Hardcoded seeds: subgroups="
+               << hardcodedSeeds->bestSubgroupCountPerWorkgroup
+               << ", MN tiles=" << hardcodedSeeds->bestMNTileCountPerSubgroup
+               << ", K tiles=" << hardcodedSeeds->bestKTileCountPerSubgroup
+               << ", K elements="
+               << hardcodedSeeds->bestKElementCountPerSubgroup;
+      }
+
+      return analyticalSeeds;
+    } else {
+      LDBG() << "Analytical model failed, falling back to hardcoded seeds";
+    }
+  }
+
+  // Fall back to hardcoded seeds
   GemmSize gemmSize = problem.gemmSize;
   int64_t inBitWidth = problem.aType.getIntOrFloatBitWidth();
   if (isGemm) {
@@ -423,7 +591,7 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   }
   LDBG() << "This config is " << problem.gemmSize;
   std::optional<GPUMMAHeuristicSeeds> maybeSeeds =
-      getContractionHeuristicSeeds(problem, isGemm, scaled);
+      getContractionHeuristicSeeds(problem, isGemm, scaled, target);
   assert(maybeSeeds.has_value() && "expected seeds to be found");
   GPUMMAHeuristicSeeds seeds = maybeSeeds.value();
 
@@ -435,11 +603,14 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   }
 
   // First try to find a schedule with an exactly matching intrinsic.
-  std::optional<GPUMMASchedule> schedule = deduceMMASchedule(
+  FailureOr<GPUMMASchedule> schedule = deduceMMASchedule(
       problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize,
       wgpCount, loc, transposedLhs, transposedRhs, /*canUpcastAcc=*/false,
       /*mustBeAligned=*/mustBeAligned, doCPromotion, splitReductionTripCnt);
-  return schedule;
+  if (failed(schedule)) {
+    return std::nullopt;
+  }
+  return schedule.value();
 }
 
 struct ConvToIgemmInfo {
