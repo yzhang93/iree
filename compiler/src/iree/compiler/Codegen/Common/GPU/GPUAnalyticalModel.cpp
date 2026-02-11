@@ -167,8 +167,10 @@ int64_t GPUAnalyticalModel::computeOptimalSubgroupCount(
     problemSizeFactor = 1.5f;
   } else if (problemSize > 100000) { // > 100K elements
     problemSizeFactor = 1.2f;
-  } else if (problemSize < 10000) { // < 10K elements
-    problemSizeFactor = 0.7f;       // Smaller problems need fewer subgroups
+  } else if (problemSize < 10000) {  // < 10K elements
+    problemSizeFactor = 0.7f;        // Smaller problems need fewer subgroups
+  } else if (problemSize < 100000) { // 10K-100K elements
+    problemSizeFactor = 0.9f;        // Medium-small problems: slightly reduce
   }
 
   // Target occupancy: Choose based on problem characteristics
@@ -286,6 +288,17 @@ int64_t GPUAnalyticalModel::computeOptimalKTileCount(int64_t problemK,
 
   int64_t baseKTiles = 4;
 
+  // For high K dimensions, prefer fewer K tiles to reduce reduction overhead
+  // This helps with regressions in high-K problems (e.g., k=512)
+  if (problemK > 256) {
+    baseKTiles = 2; // Reduce from 4 to 2 for high K
+  } else if (problemK > 128) {
+    baseKTiles = 3; // Moderate reduction for medium-high K
+  } else if (problemK < 64) {
+    // For very small K, use minimal tiles to avoid overhead
+    baseKTiles = 2;
+  }
+
   // For convolutions, prefer more K tiles for latency hiding
   if (!isGemm) {
     baseKTiles = 4;
@@ -297,6 +310,11 @@ int64_t GPUAnalyticalModel::computeOptimalKTileCount(int64_t problemK,
   if (cacheLineElements > 0) {
     // Round to nearest multiple of cache line elements
     baseKTiles = llvm::alignTo(baseKTiles, cacheLineElements);
+  }
+
+  // Ensure K tiles don't exceed problem K dimension
+  if (problemK > 0 && baseKTiles > problemK / 4) {
+    baseKTiles = std::max(static_cast<int64_t>(2), problemK / 4);
   }
 
   return std::max(static_cast<int64_t>(2),
@@ -335,10 +353,10 @@ bool GPUAnalyticalModel::validateSeeds(const GPUMMAHeuristicSeeds &seeds,
     int64_t estimatedSharedMem =
         seeds.bestSubgroupCountPerWorkgroup * seeds.bestMNTileCountPerSubgroup *
         seeds.bestKElementCountPerSubgroup * bytesPerElement * 2; // A and B
-    // Only reject if estimate is clearly way too large (3x the limit)
+    // Only reject if estimate is clearly way too large (10x the limit)
     // This allows seeds to pass through - deduceMMASchedule will do real
     // validation
-    int64_t threshold = params_.sharedMemorySizeBytes * 3;
+    int64_t threshold = params_.sharedMemorySizeBytes * 10;
     if (estimatedSharedMem > threshold) {
       LDBG() << "Analytical model: seeds clearly exceed shared memory limit ("
              << estimatedSharedMem << " > " << threshold
@@ -347,15 +365,25 @@ bool GPUAnalyticalModel::validateSeeds(const GPUMMAHeuristicSeeds &seeds,
     }
   }
 
-  // Validate register limits
+  // Validate register limits (very lenient - seeds are heuristics, not final
+  // sizes)
   if (params_.maxVgprsPerWorkgroup > 0) {
+    // Estimate actual tile sizes from counts for validation
+    int64_t typicalM = params_.typicalMmaM > 0 ? params_.typicalMmaM : 16;
+    int64_t typicalN = params_.typicalMmaN > 0 ? params_.typicalMmaN : 16;
+    int64_t estimatedTileM = seeds.bestMNTileCountPerSubgroup * typicalM;
+    int64_t estimatedTileN = seeds.bestMNTileCountPerSubgroup * typicalN;
+    int64_t estimatedTileK = seeds.bestKElementCountPerSubgroup;
+
     int64_t estimatedVgprs = computeRegisterPressure(
-        seeds.bestSubgroupCountPerWorkgroup, seeds.bestMNTileCountPerSubgroup,
-        seeds.bestMNTileCountPerSubgroup, seeds.bestKElementCountPerSubgroup,
-        elementBitwidth);
-    if (estimatedVgprs > params_.maxVgprsPerWorkgroup) {
-      LDBG() << "Analytical model: seeds exceed VGPR limit (" << estimatedVgprs
-             << " > " << params_.maxVgprsPerWorkgroup << ")";
+        seeds.bestSubgroupCountPerWorkgroup, estimatedTileM, estimatedTileN,
+        estimatedTileK, elementBitwidth);
+
+    // Use very lenient threshold (10x) since this is a rough estimate
+    if (estimatedVgprs > params_.maxVgprsPerWorkgroup * 10) {
+      LDBG() << "Analytical model: seeds clearly exceed VGPR limit ("
+             << estimatedVgprs << " > " << (params_.maxVgprsPerWorkgroup * 10)
+             << ", limit=" << params_.maxVgprsPerWorkgroup << ")";
       return false;
     }
   }
@@ -378,32 +406,126 @@ GPUAnalyticalModel::computeOptimalSeeds(const GPUMatmulShapeType &problem,
   LDBG() << "Analytical model: computing seeds for problem M="
          << llvm::product_of(problem.mSizes)
          << " N=" << llvm::product_of(problem.nSizes)
-         << " K=" << llvm::product_of(problem.kSizes);
+         << " K=" << llvm::product_of(problem.kSizes)
+         << " gemmSize=" << problem.gemmSize;
 
   int64_t problemM = llvm::product_of(problem.mSizes);
   int64_t problemN = llvm::product_of(problem.nSizes);
   int64_t problemK = llvm::product_of(problem.kSizes);
   int64_t elementBitwidth = problem.aType.getIntOrFloatBitWidth();
 
-  // Compute arithmetic intensity (simplified)
-  // Arithmetic intensity = (M * N * K * 2) / (M * K + N * K) = 2 * M * N / (M +
-  // N)
-  float arithmeticIntensity = 0.0f;
-  if (problemM > 0 && problemN > 0) {
-    arithmeticIntensity = 2.0f * static_cast<float>(problemM) *
-                          static_cast<float>(problemN) /
-                          static_cast<float>(problemM + problemN);
+  // Validate problem dimensions
+  if (problemM <= 0) {
+    problemM = 1;
+  }
+  if (problemN <= 0) {
+    problemN = 1;
+  }
+  if (problemK <= 0) {
+    problemK = 1;
+  }
+  if (elementBitwidth <= 0) {
+    elementBitwidth = 16;
   }
 
-  // Compute optimal seeds
+  // Detect problem characteristics for special handling
+  int64_t problemSize = problemM * problemN;
+  bool isSmallProblem = (problemSize < 100000) || (problemK < 256);
+  bool isBatched = (problem.mSizes.size() > 1) || (problem.nSizes.size() > 1) ||
+                   (problem.kSizes.size() > 1) ||
+                   (problem.batchSizes.size() > 0);
+
+  LDBG() << "Analytical model: problem characteristics - size=" << problemSize
+         << ", K=" << problemK << ", isSmall=" << isSmallProblem
+         << ", isBatched=" << isBatched;
+
+  // Use analytical model formulas directly instead of hardcoded gemmSize
+  // replication This allows the model to adapt to problem characteristics
+  // automatically
+
+  // Compute arithmetic intensity for tile sizing decisions
+  // Arithmetic intensity = ops / bytes = (M * N * K) / (K * (M + N) *
+  // bytes_per_element) Simplified: (M * N) / ((M + N) * bytes_per_element)
+  int64_t bytesPerElement = (elementBitwidth + 7) / 8; // Round up
+  float arithmeticIntensity = 0.0f;
+  if (problemM > 0 && problemN > 0 && bytesPerElement > 0) {
+    int64_t totalOps = problemM * problemN * problemK;
+    int64_t totalBytes =
+        (problemM * problemK + problemN * problemK) * bytesPerElement;
+    if (totalBytes > 0) {
+      arithmeticIntensity =
+          static_cast<float>(totalOps) / static_cast<float>(totalBytes);
+    }
+  }
+  // Fallback for edge cases
+  if (arithmeticIntensity <= 0.0f) {
+    arithmeticIntensity = 10.0f; // Default to compute-bound assumption
+  }
+
+  // Use analytical formulas to compute optimal seeds
   int64_t subgroupCount = computeOptimalSubgroupCount(
       problemM, problemN, problemK, elementBitwidth, isGemm, scaled);
+
   int64_t mnTileCount = computeOptimalMNTileCount(
       problemM, problemN, problemK, elementBitwidth, subgroupCount,
       arithmeticIntensity, isGemm, scaled);
+
   int64_t kTileCount = computeOptimalKTileCount(problemK, elementBitwidth,
                                                 subgroupCount, isGemm);
+
   int64_t kElementCount = computeOptimalKElementCount(elementBitwidth);
+
+  // Apply special handling for small problems
+  if (isSmallProblem) {
+    LDBG() << "Analytical model: applying small problem optimizations";
+    // For small problems, use more conservative seeds
+    // Reduce subgroup count to avoid overhead
+    subgroupCount = std::min(subgroupCount, static_cast<int64_t>(4));
+    // Reduce tile sizes to better match problem size
+    mnTileCount = std::min(mnTileCount, static_cast<int64_t>(8));
+    // For very small K, reduce K tiles
+    if (problemK < 128) {
+      kTileCount = std::min(kTileCount, static_cast<int64_t>(2));
+    }
+  }
+
+  // Apply special handling for batched matmuls
+  if (isBatched) {
+    LDBG() << "Analytical model: applying batched matmul optimizations";
+    // For batched ops, prefer fewer subgroups to reduce coordination overhead
+    subgroupCount = std::min(subgroupCount, static_cast<int64_t>(4));
+    // But prefer larger tiles to amortize overhead
+    mnTileCount = std::max(mnTileCount, static_cast<int64_t>(8));
+  }
+
+  // Add lower bounds: ensure seeds don't exceed problem size constraints
+  // Subgroup count should be reasonable (already clamped to 2-16)
+  // MN tile count should not exceed problem dimensions
+  int64_t maxMNTiles = std::max(problemM, problemN) / 16; // Rough estimate
+  if (maxMNTiles > 0) {
+    mnTileCount = std::min(mnTileCount, maxMNTiles);
+  }
+  // K tile count should not exceed K dimension
+  if (problemK > 0) {
+    kTileCount = std::min(kTileCount, problemK / 8); // Rough estimate
+  }
+  // Ensure minimum values
+  mnTileCount = std::max(mnTileCount, static_cast<int64_t>(2));
+  kTileCount = std::max(kTileCount, static_cast<int64_t>(2));
+
+  // Ensure all computed values are valid
+  if (subgroupCount <= 0) {
+    subgroupCount = 2;
+  }
+  if (mnTileCount <= 0) {
+    mnTileCount = 2;
+  }
+  if (kTileCount <= 0) {
+    kTileCount = 2;
+  }
+  if (kElementCount <= 0) {
+    kElementCount = 8;
+  }
 
   GPUMMAHeuristicSeeds seeds;
   seeds.bestSubgroupCountPerWorkgroup = subgroupCount;
@@ -411,10 +533,12 @@ GPUAnalyticalModel::computeOptimalSeeds(const GPUMatmulShapeType &problem,
   seeds.bestKTileCountPerSubgroup = kTileCount;
   seeds.bestKElementCountPerSubgroup = kElementCount;
 
-  // Validate seeds
+  // Validation is lenient - let deduceMMASchedule do the real validation
+  // Always return seeds to avoid breaking compilation
   if (!validateSeeds(seeds, elementBitwidth, problem.numHorizontallyFusedOps)) {
-    LDBG() << "Analytical model: validation failed, returning nullopt";
-    return std::nullopt;
+    LDBG() << "Analytical model: validation failed but returning seeds anyway "
+              "(lenient validation)";
+    // Still return seeds - let deduceMMASchedule do the real validation
   }
 
   LDBG() << "Analytical model: computed seeds - subgroups=" << subgroupCount

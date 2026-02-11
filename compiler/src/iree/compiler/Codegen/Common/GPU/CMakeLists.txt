@@ -192,3 +192,18 @@ iree_tablegen_doc(
 )
 
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
+
+iree_cc_library(
+  NAME
+    GPUAnalyticalModel
+  HDRS
+    "GPUAnalyticalModel.h"
+  SRCS
+    "GPUAnalyticalModel.cpp"
+  DEPS
+    LLVMSupport
+    MLIRIR
+    MLIRSupport
+    iree::compiler::Codegen::Common::GPU::GPUHeuristics
+  PUBLIC
+)

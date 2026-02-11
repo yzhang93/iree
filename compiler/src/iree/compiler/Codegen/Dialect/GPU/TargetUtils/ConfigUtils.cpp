@@ -486,18 +486,22 @@ getContractionHeuristicSeeds(GPUMatmulShapeType problem, bool isGemm,
       }
 
       return analyticalSeeds;
-    } else {
-      LDBG() << "Analytical model failed, falling back to hardcoded seeds";
     }
+    // If analytical model is enabled but failed, still return nullopt
+    // (no fallback when analytical model is enabled, as requested)
+    LDBG() << "Analytical model failed, returning nullopt";
+    return std::nullopt;
   }
 
-  // Fall back to hardcoded seeds
+  // If analytical model is not enabled, use hardcoded seeds as fallback
+  // (this is needed because the assert expects seeds to always be found)
   GemmSize gemmSize = problem.gemmSize;
   int64_t inBitWidth = problem.aType.getIntOrFloatBitWidth();
   if (isGemm) {
     return getGemmHeuristicSeeds(gemmSize, inBitWidth, scaled);
+  } else {
+    return getConvolutionHeuristicSeeds(gemmSize, inBitWidth);
   }
-  return getConvolutionHeuristicSeeds(gemmSize, inBitWidth);
 }
 
 /// Given a target and a matmul problem, try to find an MMA schedule for the
