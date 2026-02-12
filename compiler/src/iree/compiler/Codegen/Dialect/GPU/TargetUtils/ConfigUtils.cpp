@@ -44,7 +44,7 @@ static llvm::cl::opt<bool> clUseAnalyticalModel(
     "iree-codegen-use-analytical-mma-seeds",
     llvm::cl::desc(
         "Use analytical model instead of hardcoded seeds for MMA heuristics"),
-    llvm::cl::init(false));
+    llvm::cl::init(true));
 
 namespace mlir::iree_compiler::IREE::GPU {
 

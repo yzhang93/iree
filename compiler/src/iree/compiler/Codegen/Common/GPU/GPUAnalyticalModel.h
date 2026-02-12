@@ -44,78 +44,43 @@ struct GPUArchitecturalParams {
   GPUArchitecturalParams() = default;
 };
 
-/// tritonBLAS-style analytical model for GPU GEMM configuration.
+/// Analytical model for GPU GEMM configuration seed selection.
 ///
-/// Instead of using fixed heuristic thresholds, all parameters are derived
-/// from hardware specifications and the problem shape using closed-form
-/// equations.  The model follows the approach described in the tritonBLAS
-/// paper (arXiv:2512.04226):
+/// The model classifies a GEMM problem into one of three regimes
+/// (memory-bound, balanced, compute-bound) based on arithmetic intensity
+/// relative to the machine's compute-to-memory-bandwidth ratio (the
+/// "machine balance point").  Each regime maps to a fixed set of
+/// empirically-validated seed values:
 ///
-///   1. Derive BLOCK_K from cache-line width and element size so that every
-///      global memory transaction is fully utilised.
-///   2. Derive BLOCK_M/BLOCK_N from the shared-memory capacity so that the
-///      working-set (A-tile + B-tile) fits in LDS for a given pipeline depth.
-///   3. Derive the subgroup (warp) count from an occupancy model that balances
-///      register pressure and shared-memory usage against hardware limits.
-///   4. Derive the pipeline depth (K-tile count) by dividing the available
-///      LDS budget by the per-stage shared-memory footprint.
+///   Memory-bound  → sg=2  mn=2   kT=4  kE=2·cacheLine/elemBytes
+///   Balanced      → sg=4  mn=8   kT=4  kE=2·cacheLine/elemBytes
+///   Compute-bound → sg=4  mn=16  kT=2  kE=cacheLine/(2·elemBytes)
 ///
-/// The model produces `GPUMMAHeuristicSeeds` that can be consumed by the
-/// existing `deduceMMASchedule` infrastructure.
+/// The regime boundaries and seed values are derived from hardware
+/// specifications following principles similar to the tritonBLAS approach
+/// (arXiv:2512.04226):
+///
+///   • Arithmetic intensity (AI) = 2·M·N·K / ((M·K + K·N + M·N)·elemBytes)
+///   • Machine balance = peakTFLOPS·1000 / (memBW_GBps · 2 · elemBytes)
+///   • Memory-bound:  AI < 0.2 · balance   (most time in loads)
+///   • Compute-bound: AI > 20  · balance   (most time in FMAs)
+///   • Balanced:      everything in between
+///
+/// The seeds are *aspirational*: `deduceMMASchedule`'s
+/// `fitScheduleInSharedMemory` will refine the actual tile counts to fit
+/// within LDS.  Starting with these seeds lets the fitting logic converge
+/// to the best achievable schedule.
 class GPUAnalyticalModel {
 public:
   GPUAnalyticalModel(const GPUArchitecturalParams &params) : params_(params) {}
 
-  /// Compute optimal seeds derived purely from hardware parameters and the
-  /// problem shape.  Returns std::nullopt only when hardware parameters are
-  /// insufficient (all zeros).
+  /// Compute optimal seeds derived from hardware parameters and problem shape.
+  /// Returns std::nullopt only when hardware parameters are insufficient.
   std::optional<GPUMMAHeuristicSeeds>
   computeOptimalSeeds(const GPUMatmulShapeType &problem, bool isGemm,
                       bool scaled);
 
 private:
-  // ---------- Derived quantities (no magic constants) ----------
-
-  /// BLOCK_K: number of K-elements that fills one cache line.
-  ///   = cacheLineBytes / elementBytes
-  int64_t deriveBlockK(int64_t elementBytes) const;
-
-  /// Per-stage shared-memory footprint in bytes for a given tile.
-  ///   = (blockM * blockK + blockN * blockK) * elementBytes
-  int64_t sharedMemPerStage(int64_t blockM, int64_t blockN, int64_t blockK,
-                            int64_t elementBytes) const;
-
-  /// Maximum pipeline depth (stages) that fit in shared memory.
-  ///   = floor(sharedMemorySize / sharedMemPerStage)
-  int64_t deriveMaxPipelineDepth(int64_t blockM, int64_t blockN, int64_t blockK,
-                                 int64_t elementBytes) const;
-
-  /// Maximum square-ish MN block size that fits in shared memory for a given
-  /// pipeline depth and BLOCK_K.
-  ///   Solve: (blockMN + blockMN) * blockK * elementBytes * stages <= LDS
-  ///   =>     blockMN <= LDS / (2 * blockK * elementBytes * stages)
-  int64_t deriveMaxBlockMN(int64_t blockK, int64_t elementBytes,
-                           int64_t pipelineDepth) const;
-
-  /// Estimate VGPRs consumed per subgroup for a given tile.
-  ///   Each subgroup holds an accumulator tile of size
-  ///   (mTile * mmaM) * (nTile * mmaN) elements, stored in registers.
-  ///   Plus input fragments and index overhead.
-  int64_t estimateVgprsPerSubgroup(int64_t mTilesPerSubgroup,
-                                   int64_t nTilesPerSubgroup,
-                                   int64_t elementBytes) const;
-
-  /// Derive subgroup count from occupancy constraints.
-  ///   Target: maximise waves in flight while keeping VGPRs and LDS in budget.
-  int64_t deriveSubgroupCount(int64_t blockM, int64_t blockN, int64_t blockK,
-                              int64_t elementBytes,
-                              int64_t pipelineDepth) const;
-
-  /// Convert block sizes to seed values that deduceMMASchedule expects.
-  GPUMMAHeuristicSeeds blockSizesToSeeds(int64_t blockM, int64_t blockN,
-                                         int64_t blockK, int64_t subgroups,
-                                         int64_t pipelineDepth) const;
-
   GPUArchitecturalParams params_;
 };
 
