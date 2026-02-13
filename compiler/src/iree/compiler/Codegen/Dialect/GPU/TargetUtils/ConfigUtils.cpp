@@ -6,6 +6,9 @@
 
 #include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
 
+#include <cmath>
+#include <limits>
+
 #include "iree/compiler/Codegen/Common/GPU/GPUHeuristics.h"
 #include "iree/compiler/Codegen/Common/TileInferenceUtils.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
@@ -38,6 +41,13 @@ static llvm::cl::opt<bool> clGPUTestCpromotion(
     "iree-codegen-test-c-promtion",
     llvm::cl::desc("C promote in specific case of elemetwise operations that "
                    "codegen cant yet support without it if also doing padding"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> clUseRooflineSeedSelection(
+    "iree-codegen-use-roofline-seeds",
+    llvm::cl::desc(
+        "Use roofline-based candidate evaluation for MMA heuristic seeds "
+        "instead of hardcoded lookup tables"),
     llvm::cl::init(true));
 
 namespace mlir::iree_compiler::IREE::GPU {
@@ -249,6 +259,220 @@ static GemmCutoff computeGemmCutoffsForAI(IREE::GPU::TargetAttr target,
   return {smallGemmCutoff, largeGemmCutoff};
 }
 
+//===----------------------------------------------------------------------===//
+// Roofline-Based Seed Selection
+//===----------------------------------------------------------------------===//
+
+/// Hardware parameters needed for roofline cost estimation, all extracted from
+/// TargetAttr. No manually tuned constants.
+struct RooflineHardwareInfo {
+  float peakFlopsPerSec;         // Peak compute in FLOP/s for this datatype.
+  float memBandwidthBytesPerSec; // Global memory bandwidth in bytes/s.
+  int64_t maxSharedMemoryBytes;  // Max shared memory per workgroup.
+  int64_t wgpCount;              // Number of workgroup processors (CUs/SMs).
+  int64_t subgroupSize;          // Preferred subgroup (warp/wave) size.
+};
+
+/// Extract RooflineHardwareInfo from a TargetAttr. Returns std::nullopt if
+/// required fields are missing.
+static std::optional<RooflineHardwareInfo>
+extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
+                            bool scaled) {
+  if (!target || !target.getChip()) {
+    return std::nullopt;
+  }
+
+  TargetChipAttr chip = target.getChip();
+
+  // Extract peak TFLOPS for the compute datatype.
+  DictionaryAttr perfTflopsAttr = chip.getPerfTflops();
+  if (!perfTflopsAttr) {
+    return std::nullopt;
+  }
+
+  std::optional<ComputeBitwidths> computeBitwidth =
+      getComputeBitwidthForType(computeType);
+  if (!computeBitwidth) {
+    return std::nullopt;
+  }
+
+  float peakTflops = 0.0f;
+  for (NamedAttribute namedAttr : perfTflopsAttr) {
+    StringRef bitwidthStr = namedAttr.getName().strref();
+    auto floatAttr = dyn_cast<FloatAttr>(namedAttr.getValue());
+    if (!floatAttr) {
+      continue;
+    }
+    std::optional<ComputeBitwidths> bw = symbolizeComputeBitwidths(bitwidthStr);
+    if (bw && *bw == *computeBitwidth) {
+      peakTflops = floatAttr.getValue().convertToFloat();
+      break;
+    }
+  }
+  if (peakTflops == 0.0f) {
+    return std::nullopt;
+  }
+
+  // Extract memory bandwidth.
+  FloatAttr memBwAttr = chip.getMemoryBandwidthTbps();
+  if (!memBwAttr) {
+    return std::nullopt;
+  }
+  float memBandwidthTbps = memBwAttr.getValue().convertToFloat();
+  if (memBandwidthTbps == 0.0f) {
+    return std::nullopt;
+  }
+
+  // Convert units: TFLOPS -> FLOP/s, Tbps -> bytes/s.
+  float peakFlopsPerSec = peakTflops * 1e12f;
+  float memBandwidthBytesPerSec = memBandwidthTbps * 1e12f / 8.0f;
+
+  int64_t maxSharedMemBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
+  int64_t wgpCount = chip.getWgpCount();
+  int64_t subgroupSize = target.getPreferredSubgroupSize();
+
+  return RooflineHardwareInfo{peakFlopsPerSec, memBandwidthBytesPerSec,
+                              maxSharedMemBytes, wgpCount, subgroupSize};
+}
+
+/// Evaluate a single seed candidate using a roofline cost model.
+/// Returns a predicted cost (lower is better). All inputs come from either
+/// the problem dimensions or hardware specs -- zero tuning constants.
+/// Returns a very large cost if the candidate is infeasible (e.g., exceeds
+/// shared memory).
+static double evaluateSeedCandidate(
+    int64_t subgroupCount, int64_t mnTileCount, int64_t kTileCount,
+    int64_t mSize, int64_t nSize, int64_t kSize, int64_t bytesPerElem,
+    const RooflineHardwareInfo &hw, int64_t intrinsicM, int64_t intrinsicN,
+    int64_t intrinsicK, int64_t splitReductionTripCnt = 0) {
+  // Step 1: Estimate tile dimensions from seeds + intrinsic shape.
+  // Use the same sqrt-based distribution as getOptimalMMASchedule.
+  int64_t sgSqrt = 1ull << llvm::divideCeil(llvm::Log2_64(subgroupCount), 2);
+  int64_t tileSqrt = 1ull << (llvm::Log2_64(mnTileCount) / 2);
+
+  int64_t wgTileM = sgSqrt * tileSqrt * intrinsicM;
+  int64_t wgTileN =
+      (subgroupCount / sgSqrt) * (mnTileCount / tileSqrt) * intrinsicN;
+  int64_t wgTileK = kTileCount * intrinsicK;
+
+  // Ensure non-zero tile dimensions.
+  if (wgTileM <= 0 || wgTileN <= 0 || wgTileK <= 0) {
+    return std::numeric_limits<double>::max();
+  }
+
+  // Step 2: Shared memory constraint (hard filter).
+  int64_t sharedMemUsed =
+      (wgTileM * wgTileK + wgTileN * wgTileK) * bytesPerElem;
+  if (sharedMemUsed > hw.maxSharedMemoryBytes) {
+    return std::numeric_limits<double>::max();
+  }
+
+  // Step 3: Occupancy -- number of timesteps to process all workgroups.
+  // When split-K reduction is active, the K dimension is distributed across
+  // splitReductionTripCnt workgroups, increasing total WG count and reducing
+  // the per-WG K iterations proportionally.
+  int64_t splitK = splitReductionTripCnt > 1 ? splitReductionTripCnt : 1;
+  int64_t numWGs_MN =
+      llvm::divideCeil(mSize, wgTileM) * llvm::divideCeil(nSize, wgTileN);
+  int64_t numWGs = numWGs_MN * splitK;
+  int64_t numTimesteps = llvm::divideCeil(numWGs, hw.wgpCount);
+
+  // Step 4: Work utilization (padding waste).
+  double paddedArea = (double)(llvm::divideCeil(mSize, wgTileM) * wgTileM) *
+                      (double)(llvm::divideCeil(nSize, wgTileN) * wgTileN);
+  double workUtil = ((double)mSize * nSize) / paddedArea;
+  // Clamp to avoid division by zero.
+  if (workUtil < 0.01) {
+    workUtil = 0.01;
+  }
+
+  // Step 5: Roofline cost per K-iteration per workgroup.
+  double bytesLoaded = (double)(wgTileM + wgTileN) * wgTileK * bytesPerElem;
+  double flops = 2.0 * wgTileM * wgTileN * wgTileK;
+
+  // Per-WGP bandwidth and compute share. Each WG competes with all other
+  // WGs on the chip for bandwidth/compute resources. Using wgpCount as the
+  // divisor is a constant that cancels in relative comparisons, but it
+  // correctly models per-wave resource sharing for well-occupied problems.
+  // For under-occupied problems, L2 cache makes total DRAM traffic nearly
+  // independent of tiling, so the per-WG cost (dominated by tile shape and
+  // workUtil) becomes the effective differentiator.
+  double memTime = bytesLoaded / (hw.memBandwidthBytesPerSec / hw.wgpCount);
+  double compTime = flops / (hw.peakFlopsPerSec / hw.wgpCount);
+  double iterCost = std::max(memTime, compTime);
+
+  // Step 6: Total predicted cost.
+  // Each WG processes K/splitK elements along the reduction dimension.
+  int64_t effectiveK = llvm::divideCeil(kSize, splitK);
+  int64_t kIters = llvm::divideCeil(effectiveK, wgTileK);
+  double totalCost = iterCost * kIters * numTimesteps / workUtil;
+
+  return totalCost;
+}
+
+/// Enumerate seed candidates and select the one with the lowest roofline cost
+/// for a specific intrinsic.
+/// The candidate space is: subgroupCount in {2, 4, 8},
+///                         mnTileCount in {2, 4, 8, 16, 32},
+///                         kTileCount in {2, 4}.
+/// bestKElementCountPerSubgroup is derived from the chosen kTileCount and
+/// the intrinsic's K dimension.
+static GPUMMAHeuristicSeeds
+selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
+                const RooflineHardwareInfo &hw, int64_t intrinsicM,
+                int64_t intrinsicN, int64_t intrinsicK,
+                int64_t splitReductionTripCnt = 0) {
+  static constexpr int64_t kSubgroupCounts[] = {2, 4, 8};
+  static constexpr int64_t kMNTileCounts[] = {2, 4, 8, 16, 32};
+  static constexpr int64_t kKTileCounts[] = {2, 4};
+
+  int64_t bytesPerElem = inBitWidth / 8;
+  if (bytesPerElem == 0) {
+    bytesPerElem = 1;
+  }
+
+  double bestCost = std::numeric_limits<double>::max();
+  int64_t bestSubgroupCount = 4;
+  int64_t bestMNTileCount = 8;
+  int64_t bestKTileCount = 2;
+
+  for (int64_t sg : kSubgroupCounts) {
+    for (int64_t mn : kMNTileCounts) {
+      for (int64_t kt : kKTileCounts) {
+        double cost = evaluateSeedCandidate(
+            sg, mn, kt, mSize, nSize, kSize, bytesPerElem, hw, intrinsicM,
+            intrinsicN, intrinsicK, splitReductionTripCnt);
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestSubgroupCount = sg;
+          bestMNTileCount = mn;
+          bestKTileCount = kt;
+        }
+      }
+    }
+  }
+
+  // Derive bestKElementCountPerSubgroup from kTileCount and intrinsic K.
+  int64_t bestKElementCount = bestKTileCount * intrinsicK;
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "[RooflineSeeds] Selected seeds for intrinsic "
+                 << intrinsicM << "x" << intrinsicN << "x" << intrinsicK
+                 << ": subgroupCount=" << bestSubgroupCount
+                 << ", mnTileCount=" << bestMNTileCount
+                 << ", kTileCount=" << bestKTileCount
+                 << ", kElementCount=" << bestKElementCount
+                 << " (cost=" << bestCost << ")\n";
+  });
+
+  return GPUMMAHeuristicSeeds{bestSubgroupCount, bestMNTileCount,
+                              bestKTileCount, bestKElementCount};
+}
+
+//===----------------------------------------------------------------------===//
+// Hardcoded Seed Lookup Tables (fallback)
+//===----------------------------------------------------------------------===//
+
 static std::optional<GPUMMAHeuristicSeeds>
 getGemmHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth, bool scaled) {
   switch (gemmSize) {
@@ -324,8 +548,8 @@ getConvolutionHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth) {
 static std::optional<GPUMMAHeuristicSeeds>
 getContractionHeuristicSeeds(GPUMatmulShapeType problem, bool isGemm,
                              bool scaled) {
-  GemmSize gemmSize = problem.gemmSize;
   int64_t inBitWidth = problem.aType.getIntOrFloatBitWidth();
+  GemmSize gemmSize = problem.gemmSize;
   if (isGemm) {
     return getGemmHeuristicSeeds(gemmSize, inBitWidth, scaled);
   }
@@ -434,11 +658,38 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
     wgpCount = chip.getWgpCount();
   }
 
+  // Build a roofline-based seed selector callback if enabled and hardware info
+  // is available. When provided, deduceMMASchedule will call this for each
+  // intrinsic it tries, so seeds are computed with the exact intrinsic shape.
+  std::optional<SeedSelector> seedSelector = std::nullopt;
+  if (clUseRooflineSeedSelection) {
+    std::optional<RooflineHardwareInfo> hwInfo =
+        extractRooflineHardwareInfo(target, problem.aType, scaled);
+    if (hwInfo) {
+      int64_t inBitWidth = problem.aType.getIntOrFloatBitWidth();
+      seedSelector =
+          [hwInfo = *hwInfo, mSize, nSize, kSize, inBitWidth,
+           splitReductionTripCnt](const GPUMatmulShapeType & /*problem*/,
+                                  const GPUIntrinsicType &intrinsic) {
+            LDBG() << "Roofline seed selection for intrinsic "
+                   << intrinsic.mSizes[0] << "x" << intrinsic.nSizes[0] << "x"
+                   << intrinsic.kSizes[0];
+            return selectBestSeeds(mSize, nSize, kSize, inBitWidth, hwInfo,
+                                   intrinsic.mSizes[0], intrinsic.nSizes[0],
+                                   intrinsic.kSizes[0], splitReductionTripCnt);
+          };
+    } else {
+      LDBG() << "Roofline seed selection requested but hardware info "
+                "incomplete, falling back to hardcoded seeds";
+    }
+  }
+
   // First try to find a schedule with an exactly matching intrinsic.
   std::optional<GPUMMASchedule> schedule = deduceMMASchedule(
       problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize,
       wgpCount, loc, transposedLhs, transposedRhs, /*canUpcastAcc=*/false,
-      /*mustBeAligned=*/mustBeAligned, doCPromotion, splitReductionTripCnt);
+      /*mustBeAligned=*/mustBeAligned, doCPromotion, splitReductionTripCnt,
+      seedSelector);
   return schedule;
 }
 

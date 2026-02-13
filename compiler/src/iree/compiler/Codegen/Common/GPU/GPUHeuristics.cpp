@@ -666,7 +666,8 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
     const GPUMMAHeuristicSeeds &seeds, int64_t sharedMemLimitInBytes,
     int64_t subgroupSize, std::optional<int64_t> wgpCount, Location loc,
     bool transposedLhs, bool transposedRhs, bool canUpcastAcc,
-    bool mustBeAligned, bool doCPromotion, int64_t splitReductionTripCnt) {
+    bool mustBeAligned, bool doCPromotion, int64_t splitReductionTripCnt,
+    std::optional<SeedSelector> seedSelector) {
 
   SmallVector<GPUIntrinsicType> sortedIntrinsics =
       sortMMAIntrinsics(problem, intrinsics);
@@ -677,10 +678,12 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
       continue;
     }
 
-    // Note: don't amend the original seeds, as deduceMMASchedule can be called
-    // more than once in a row, and we want to keep the original seeds intact
-    // for the next call.
-    GPUMMAHeuristicSeeds localSeeds = seeds;
+    // When a seed selector callback is provided, use it to compute seeds
+    // tailored to this specific intrinsic. Otherwise use the caller-provided
+    // default seeds. Either way, don't amend the original seeds, as
+    // deduceMMASchedule can be called more than once in a row.
+    GPUMMAHeuristicSeeds localSeeds =
+        seedSelector ? (*seedSelector)(problem, intrinsic) : seeds;
     localSeeds.bestMNTileCountPerSubgroup = adjustSeedsForWgpCount(
         problem, intrinsic, wgpCount, seeds.bestSubgroupCountPerWorkgroup,
         seeds.bestMNTileCountPerSubgroup, splitReductionTripCnt);
