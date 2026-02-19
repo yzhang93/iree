@@ -679,8 +679,11 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
                                    intrinsic.kSizes[0], splitReductionTripCnt);
           };
     } else {
-      LDBG() << "Roofline seed selection requested but hardware info "
-                "incomplete, falling back to hardcoded seeds";
+      llvm::errs()
+          << "ERROR: Roofline seed selection enabled but hardware info "
+             "incomplete (missing chip attributes?). Aborting to prevent "
+             "silent fallback to hardcoded seeds.\n";
+      return std::nullopt;
     }
   }
 
