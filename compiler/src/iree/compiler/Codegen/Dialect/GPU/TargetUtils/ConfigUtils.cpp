@@ -271,6 +271,8 @@ struct RooflineHardwareInfo {
   int64_t maxSharedMemoryBytes;  // Max shared memory per workgroup.
   int64_t wgpCount;              // Number of workgroup processors (CUs/SMs).
   int64_t subgroupSize;          // Preferred subgroup (warp/wave) size.
+  int64_t simdsPerWgp;           // Number of SIMD units per WGP.
+  int64_t vgprsPerSimd;          // Number of 32-bit VGPRs per SIMD unit.
 };
 
 /// Extract RooflineHardwareInfo from a TargetAttr. Returns std::nullopt if
@@ -327,12 +329,26 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
   float peakFlopsPerSec = peakTflops * 1e12f;
   float memBandwidthBytesPerSec = memBandwidthTbps * 1e12f / 8.0f;
 
-  int64_t maxSharedMemBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
+  auto wgp = target.getWgp();
+  int64_t maxSharedMemBytes = wgp.getMaxWorkgroupMemoryBytes();
   int64_t wgpCount = chip.getWgpCount();
   int64_t subgroupSize = target.getPreferredSubgroupSize();
 
-  return RooflineHardwareInfo{peakFlopsPerSec, memBandwidthBytesPerSec,
-                              maxSharedMemBytes, wgpCount, subgroupSize};
+  // Extract SIMD topology from WGP attributes (required for occupancy model).
+  auto optSimdsPerWgp = wgp.getSimdsPerWgp();
+  auto optVgprSpaceBits = wgp.getVgprSpaceBits();
+  if (!optSimdsPerWgp || !optVgprSpaceBits) {
+    return std::nullopt;
+  }
+  int64_t simdsPerWgp = *optSimdsPerWgp;
+  // vgprSpaceBits is the VGPR bit-space per SIMD (numVGPRs * 32 bits each).
+  // Divide by 32 to get the number of 32-bit VGPRs per SIMD.
+  int64_t vgprsPerSimd = *optVgprSpaceBits / 32;
+
+  return RooflineHardwareInfo{peakFlopsPerSec,   memBandwidthBytesPerSec,
+                              maxSharedMemBytes, wgpCount,
+                              subgroupSize,      simdsPerWgp,
+                              vgprsPerSimd};
 }
 
 /// Evaluate a single seed candidate using a roofline cost model.
@@ -340,6 +356,14 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
 /// the problem dimensions or hardware specs -- zero tuning constants.
 /// Returns a very large cost if the candidate is infeasible (e.g., exceeds
 /// shared memory).
+///
+/// The model extends the classic roofline by incorporating:
+/// 1. **LDS-based occupancy**: How many concurrent workgroups can share each
+///    WGP, limited by shared memory usage per workgroup.
+/// 2. **Register-pressure occupancy**: MMA accumulator registers scale with
+///    mnTileCount; large tiles reduce the number of concurrent waves.
+/// 3. **Effective bandwidth scaling**: At low occupancy the GPU cannot fully
+///    hide memory latency, so effective bandwidth is derated.
 static double evaluateSeedCandidate(
     int64_t subgroupCount, int64_t mnTileCount, int64_t kTileCount,
     int64_t mSize, int64_t nSize, int64_t kSize, int64_t bytesPerElem,
@@ -367,7 +391,47 @@ static double evaluateSeedCandidate(
     return std::numeric_limits<double>::max();
   }
 
-  // Step 3: Occupancy -- number of timesteps to process all workgroups.
+  // Step 3: Occupancy estimation.
+  // 3a: LDS-based occupancy — how many WGs fit in shared memory per WGP.
+  int64_t ldsOccupancy = hw.maxSharedMemoryBytes / std::max(sharedMemUsed, 1L);
+
+  // 3b: Register-based occupancy estimate.
+  // Each MMA tile (intrinsicM × intrinsicN) produces accumulator values that
+  // are distributed across subgroupSize threads. For f32 accumulators:
+  //   accVGPRs = mnTileCount * intrinsicM * intrinsicN / subgroupSize
+  int64_t accVGPRs = mnTileCount * intrinsicM * intrinsicN / hw.subgroupSize;
+  // Input operand VGPRs: each wave holds its A and B operands for the MMA.
+  // Per single MMA instruction, A needs (intrinsicM*intrinsicK/subgroupSize)
+  // elements and B needs (intrinsicK*intrinsicN/subgroupSize) elements,
+  // packed into 32-bit VGPRs. The wave reuses A across N-tiles and B across
+  // M-tiles, so multiply by mTile and nTile respectively.  We approximate
+  // mTile ≈ nTile ≈ sqrt(mnTileCount) since the exact split is unknown here.
+  int64_t sqrtMN =
+      std::max(1L, (int64_t)std::ceil(std::sqrt((double)mnTileCount)));
+  int64_t aVGPRsPerMMA = llvm::divideCeil(
+      intrinsicM * intrinsicK * bytesPerElem, hw.subgroupSize * 4);
+  int64_t bVGPRsPerMMA = llvm::divideCeil(
+      intrinsicK * intrinsicN * bytesPerElem, hw.subgroupSize * 4);
+  int64_t operandVGPRs = sqrtMN * (aVGPRsPerMMA + bVGPRsPerMMA);
+  int64_t totalVGPRs = accVGPRs + operandVGPRs;
+  int64_t waveLimitPerSimd = hw.vgprsPerSimd / std::max(totalVGPRs, 1L);
+
+  // 3c: Account for waves-per-WG. A WG with `subgroupCount` waves needs
+  // ceil(subgroupCount / simdsPerWgp) waves on each SIMD. This limits how
+  // many WGs can coexist on a WGP. For example, a WG with 8 subgroups on a
+  // 4-SIMD WGP needs 2 waves per SIMD, so at most floor(waveLimitPerSimd/2)
+  // WGs can run concurrently from a register perspective.
+  int64_t wavesPerSimdPerWG = llvm::divideCeil(subgroupCount, hw.simdsPerWgp);
+  int64_t regOccupancy =
+      std::max(1L, waveLimitPerSimd / std::max(wavesPerSimdPerWG, 1L));
+
+  // Effective occupancy is the minimum of LDS-based and register-based,
+  // capped at a practical maximum.
+  constexpr int64_t kMaxOccupancy = 10;
+  int64_t occupancy =
+      std::max(1L, std::min({ldsOccupancy, regOccupancy, kMaxOccupancy}));
+
+  // Step 4: Workgroup count and timesteps.
   // When split-K reduction is active, the K dimension is distributed across
   // splitReductionTripCnt workgroups, increasing total WG count and reducing
   // the per-WG K iterations proportionally.
@@ -375,9 +439,10 @@ static double evaluateSeedCandidate(
   int64_t numWGs_MN =
       llvm::divideCeil(mSize, wgTileM) * llvm::divideCeil(nSize, wgTileN);
   int64_t numWGs = numWGs_MN * splitK;
-  int64_t numTimesteps = llvm::divideCeil(numWGs, hw.wgpCount);
+  // With occupancy O, the GPU can process O workgroups concurrently per WGP.
+  int64_t numTimesteps = llvm::divideCeil(numWGs, hw.wgpCount * occupancy);
 
-  // Step 4: Work utilization (padding waste).
+  // Step 5: Work utilization (padding waste).
   double paddedArea = (double)(llvm::divideCeil(mSize, wgTileM) * wgTileM) *
                       (double)(llvm::divideCeil(nSize, wgTileN) * wgTileN);
   double workUtil = ((double)mSize * nSize) / paddedArea;
@@ -386,22 +451,29 @@ static double evaluateSeedCandidate(
     workUtil = 0.01;
   }
 
-  // Step 5: Roofline cost per K-iteration per workgroup.
+  // Step 6: Roofline cost per K-iteration per workgroup.
   double bytesLoaded = (double)(wgTileM + wgTileN) * wgTileK * bytesPerElem;
   double flops = 2.0 * wgTileM * wgTileN * wgTileK;
 
-  // Per-WGP bandwidth and compute share. Each WG competes with all other
-  // WGs on the chip for bandwidth/compute resources. Using wgpCount as the
-  // divisor is a constant that cancels in relative comparisons, but it
-  // correctly models per-wave resource sharing for well-occupied problems.
-  // For under-occupied problems, L2 cache makes total DRAM traffic nearly
-  // independent of tiling, so the per-WG cost (dominated by tile shape and
-  // workUtil) becomes the effective differentiator.
-  double memTime = bytesLoaded / (hw.memBandwidthBytesPerSec / hw.wgpCount);
-  double compTime = flops / (hw.peakFlopsPerSec / hw.wgpCount);
+  // Memory bandwidth is shared among all concurrent WGs on the chip. With
+  // occupancy O, there are wgpCount*O concurrent WGs sharing bandwidth.
+  double concurrentWGs = (double)hw.wgpCount * occupancy;
+  double memTime = bytesLoaded / (hw.memBandwidthBytesPerSec / concurrentWGs);
+  double compTime = flops / (hw.peakFlopsPerSec / concurrentWGs);
+
+  // At low occupancy the GPU cannot fully hide memory latency, reducing
+  // effective bandwidth utilization. Model this with a bandwidth efficiency
+  // factor: efficiency ramps linearly from (1/saturationOccupancy) at
+  // occupancy=1 to 1.0 at occupancy=saturationOccupancy.
+  // For memory-bound kernels this is the dominant differentiator.
+  constexpr int64_t kOccupancySaturation = 4;
+  double bwEfficiency = std::min(1.0, (double)occupancy / kOccupancySaturation);
+  // Apply: less efficient bandwidth → longer memory time.
+  memTime /= bwEfficiency;
+
   double iterCost = std::max(memTime, compTime);
 
-  // Step 6: Total predicted cost.
+  // Step 7: Total predicted cost.
   // Each WG processes K/splitK elements along the reduction dimension.
   int64_t effectiveK = llvm::divideCeil(kSize, splitK);
   int64_t kIters = llvm::divideCeil(effectiveK, wgTileK);
@@ -424,7 +496,7 @@ selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
                 int64_t splitReductionTripCnt = 0) {
   static constexpr int64_t kSubgroupCounts[] = {2, 4, 8};
   static constexpr int64_t kMNTileCounts[] = {2, 4, 8, 16, 32};
-  static constexpr int64_t kKTileCounts[] = {2, 4};
+  static constexpr int64_t kKTileCounts[] = {1, 2, 4, 8};
 
   int64_t bytesPerElem = inBitWidth / 8;
   if (bytesPerElem == 0) {

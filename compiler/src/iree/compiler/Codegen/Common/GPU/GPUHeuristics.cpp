@@ -684,9 +684,10 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
     // deduceMMASchedule can be called more than once in a row.
     GPUMMAHeuristicSeeds localSeeds =
         seedSelector ? (*seedSelector)(problem, intrinsic) : seeds;
+    auto bestMNTileCountPerSubgroup = localSeeds.bestMNTileCountPerSubgroup;
     localSeeds.bestMNTileCountPerSubgroup = adjustSeedsForWgpCount(
-        problem, intrinsic, wgpCount, seeds.bestSubgroupCountPerWorkgroup,
-        seeds.bestMNTileCountPerSubgroup, splitReductionTripCnt);
+        problem, intrinsic, wgpCount, localSeeds.bestSubgroupCountPerWorkgroup,
+        bestMNTileCountPerSubgroup, splitReductionTripCnt);
     GPUMMASchedule schedule =
         getOptimalMMASchedule(problem, intrinsic, localSeeds);
 
