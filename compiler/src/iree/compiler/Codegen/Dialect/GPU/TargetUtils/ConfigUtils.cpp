@@ -362,8 +362,10 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
 ///    WGP, limited by shared memory usage per workgroup.
 /// 2. **Register-pressure occupancy**: MMA accumulator registers scale with
 ///    mnTileCount; large tiles reduce the number of concurrent waves.
-/// 3. **Effective bandwidth scaling**: At low occupancy the GPU cannot fully
-///    hide memory latency, so effective bandwidth is derated.
+///    Candidates that exceed the VGPR limit are rejected as infeasible.
+/// 3. **Bandwidth efficiency scaling**: At low occupancy the GPU cannot fully
+///    hide memory latency, so effective bandwidth is derated.  This prevents
+///    the model from blindly preferring maximum tile sizes.
 static double evaluateSeedCandidate(
     int64_t subgroupCount, int64_t mnTileCount, int64_t kTileCount,
     int64_t mSize, int64_t nSize, int64_t kSize, int64_t bytesPerElem,
@@ -414,6 +416,14 @@ static double evaluateSeedCandidate(
       intrinsicK * intrinsicN * bytesPerElem, hw.subgroupSize * 4);
   int64_t operandVGPRs = sqrtMN * (aVGPRsPerMMA + bVGPRsPerMMA);
   int64_t totalVGPRs = accVGPRs + operandVGPRs;
+
+  // Hard constraint: if a single wave cannot fit in one SIMD's register file,
+  // the compiler must spill registers to memory, causing catastrophic slowdown.
+  // Treat this the same as exceeding shared memory — the candidate is infeasible.
+  if (totalVGPRs > hw.vgprsPerSimd) {
+    return std::numeric_limits<double>::max();
+  }
+
   int64_t waveLimitPerSimd = hw.vgprsPerSimd / std::max(totalVGPRs, 1L);
 
   // 3c: Account for waves-per-WG. A WG with `subgroupCount` waves needs
@@ -455,20 +465,21 @@ static double evaluateSeedCandidate(
   double bytesLoaded = (double)(wgTileM + wgTileN) * wgTileK * bytesPerElem;
   double flops = 2.0 * wgTileM * wgTileN * wgTileK;
 
-  // Memory bandwidth is shared among all concurrent WGs on the chip. With
-  // occupancy O, there are wgpCount*O concurrent WGs sharing bandwidth.
+  // Memory bandwidth and compute throughput are shared among all concurrent
+  // WGs on the chip. With occupancy O, there are wgpCount*O concurrent WGs.
   double concurrentWGs = (double)hw.wgpCount * occupancy;
   double memTime = bytesLoaded / (hw.memBandwidthBytesPerSec / concurrentWGs);
   double compTime = flops / (hw.peakFlopsPerSec / concurrentWGs);
 
   // At low occupancy the GPU cannot fully hide memory latency, reducing
-  // effective bandwidth utilization. Model this with a bandwidth efficiency
-  // factor: efficiency ramps linearly from (1/saturationOccupancy) at
-  // occupancy=1 to 1.0 at occupancy=saturationOccupancy.
-  // For memory-bound kernels this is the dominant differentiator.
+  // effective bandwidth utilization.  The penalty ensures the *total* cost
+  // (iterCost × numTimesteps) correctly favours higher-occupancy configs:
+  //   totalCost ∝ bytesLoaded × numWGs / (bandwidth × bwEfficiency × occ)
+  // For occ < saturation this simplifies to ∝ 1/occ, so configs with more
+  // concurrent WGs (smaller tiles, higher occ) are rewarded.
   constexpr int64_t kOccupancySaturation = 4;
-  double bwEfficiency = std::min(1.0, (double)occupancy / kOccupancySaturation);
-  // Apply: less efficient bandwidth → longer memory time.
+  double bwEfficiency =
+      std::min(1.0, (double)occupancy / kOccupancySaturation);
   memTime /= bwEfficiency;
 
   double iterCost = std::max(memTime, compTime);
@@ -479,6 +490,13 @@ static double evaluateSeedCandidate(
   int64_t kIters = llvm::divideCeil(effectiveK, wgTileK);
   double totalCost = iterCost * kIters * numTimesteps / workUtil;
 
+  // Tie-break bias: when different (subgroupCount, mnTileCount) pairs produce
+  // the same tile dimensions, their costs are (near-)identical.  Slightly
+  // penalise higher subgroup counts so the search consistently prefers fewer,
+  // larger per-subgroup tiles (e.g. sg=4/mn=16 over sg=8/mn=8).  The 1e-6
+  // multiplier is too small to change the ranking of genuinely different costs.
+  totalCost *= (1.0 + 1e-6 * (double)subgroupCount);
+
   return totalCost;
 }
 
@@ -486,9 +504,12 @@ static double evaluateSeedCandidate(
 /// for a specific intrinsic.
 /// The candidate space is: subgroupCount in {2, 4, 8},
 ///                         mnTileCount in {2, 4, 8, 16, 32},
-///                         kTileCount in {2, 4}.
+///                         kTileCount in {1, 2, 4, 8}.
 /// bestKElementCountPerSubgroup is derived from the chosen kTileCount and
 /// the intrinsic's K dimension.
+///
+/// When multiple candidates have equal cost, the tie-break favours fewer
+/// subgroups with more tiles per subgroup (matching the baseline pattern).
 static GPUMMAHeuristicSeeds
 selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
                 const RooflineHardwareInfo &hw, int64_t intrinsicM,
@@ -520,6 +541,53 @@ selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
           bestMNTileCount = mn;
           bestKTileCount = kt;
         }
+      }
+    }
+  }
+
+  // Post-search subgroup fixup: when the best config uses more subgroups than
+  // SIMDs per WGP, each SIMD must run multiple waves from the same workgroup.
+  // The cost model slightly favours this (due to less last-timestep waste) but
+  // in practice having fewer, larger per-wave tiles yields much better
+  // instruction-level parallelism (more MMA ops to interleave with loads).
+  // Replace with the equivalent config (same WG tile) that has at most
+  // simdsPerWgp subgroups.
+  if (bestSubgroupCount > hw.simdsPerWgp) {
+    int64_t totalTiles = bestSubgroupCount * bestMNTileCount;
+    // Search from the largest sg ≤ simdsPerWgp downward.
+    for (int64_t i = std::size(kSubgroupCounts); i-- > 0;) {
+      int64_t sg = kSubgroupCounts[i];
+      if (sg > hw.simdsPerWgp || sg >= bestSubgroupCount)
+        continue;
+      if (totalTiles % sg != 0)
+        continue;
+      int64_t mn = totalTiles / sg;
+      // Check mn is in the search space.
+      bool validMN = false;
+      for (int64_t m : kMNTileCounts) {
+        if (m == mn) {
+          validMN = true;
+          break;
+        }
+      }
+      if (!validMN)
+        continue;
+      // Quick feasibility check: per-wave VGPRs must fit in the register file.
+      int64_t acc = mn * intrinsicM * intrinsicN / hw.subgroupSize;
+      int64_t sqMN =
+          std::max(1L, (int64_t)std::ceil(std::sqrt((double)mn)));
+      int64_t aV = llvm::divideCeil(intrinsicM * intrinsicK * bytesPerElem,
+                                    hw.subgroupSize * 4);
+      int64_t bV = llvm::divideCeil(intrinsicK * intrinsicN * bytesPerElem,
+                                    hw.subgroupSize * 4);
+      if (acc + sqMN * (aV + bV) <= hw.vgprsPerSimd) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[RooflineSeeds] Subgroup fixup: sg=" << bestSubgroupCount
+                   << "/mn=" << bestMNTileCount << " -> sg=" << sg
+                   << "/mn=" << mn << " (same WG tile, fewer subgroups)\n");
+        bestSubgroupCount = sg;
+        bestMNTileCount = mn;
+        break;
       }
     }
   }
