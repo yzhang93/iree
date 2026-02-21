@@ -356,7 +356,7 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
 /// candidate is infeasible (e.g., exceeds shared memory or register limits).
 ///
 /// The model is:
-///   cost = max(memBound, compBound) * kIters * numWGs / workUtil
+///   cost = max(memBound, compBound) * kIters * numWGs / workUtil * penalties
 ///
 /// Key features:
 /// 1. **Shared-memory feasibility**: Candidates whose LDS usage exceeds the
@@ -364,13 +364,19 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
 /// 2. **Register-pressure feasibility**: Candidates whose per-SIMD VGPR demand
 ///    (accounting for multiple waves per SIMD) exceeds the hardware limit are
 ///    rejected.
-/// 3. **L2-cache-aware memory model**: A tiles are reused across N-columns of
+/// 3. **Occupancy computation**: Per-WGP occupancy from LDS and register
+///    constraints determines the GPU's latency-hiding ability.
+/// 4. **L2-cache-aware memory model**: A tiles are reused across N-columns of
 ///    workgroups and B tiles across M-rows, reducing effective HBM traffic.
-/// 4. **Fractional workgroup counts**: The cost uses numWGs directly (not
+/// 5. **Fractional workgroup counts**: The cost uses numWGs directly (not
 ///    ceiling-based timesteps).  For memory-bound GEMMs, total HBM traffic is
 ///    constant regardless of kTile, so integer timesteps would create
 ///    artificial cost differences.  Fractional counts make the cost kTile-
 ///    independent, correctly delegating kTile selection to iteration order.
+/// 6. **Occupancy latency penalty**: Configurations with low per-WGP occupancy
+///    are penalized because fewer concurrent WGs limit memory latency hiding.
+///    This primarily affects MediumGemm (kTile=4) shapes where large tiles
+///    reduce occupancy.
 static double evaluateSeedCandidate(
     int64_t subgroupCount, int64_t mnTileCount, int64_t kTileCount,
     int64_t mSize, int64_t nSize, int64_t kSize, int64_t bytesPerElem,
@@ -416,7 +422,17 @@ static double evaluateSeedCandidate(
     return std::numeric_limits<double>::max();
   }
 
-  // Step 4: Workgroup count and K-loop iterations.
+  // Step 4: Achievable occupancy (WGs per WGP).
+  //
+  // Occupancy is the minimum of the LDS-limited and register-limited values.
+  // This determines how many workgroups can execute concurrently on each WGP,
+  // which directly affects the GPU's ability to hide memory latency.
+  int64_t ldsOcc = hw.maxSharedMemoryBytes / std::max(sharedMemUsed, 1L);
+  int64_t maxWavesPerSimd = hw.vgprsPerSimd / std::max(totalVGPRs, 1L);
+  int64_t regOcc = maxWavesPerSimd / std::max(wavesPerSimdPerWG, 1L);
+  int64_t occupancy = std::max(1L, std::min(ldsOcc, regOcc));
+
+  // Step 5: Workgroup count and K-loop iterations.
   int64_t splitK = splitReductionTripCnt > 1 ? splitReductionTripCnt : 1;
   int64_t numWGs_M = llvm::divideCeil(mSize, wgTileM);
   int64_t numWGs_N = llvm::divideCeil(nSize, wgTileN);
@@ -425,7 +441,7 @@ static double evaluateSeedCandidate(
   int64_t effectiveK = llvm::divideCeil(kSize, splitK);
   int64_t kIters = llvm::divideCeil(effectiveK, wgTileK);
 
-  // Step 5: Work utilization (padding waste).
+  // Step 6: Work utilization (padding waste).
   double paddedArea = (double)(numWGs_M * wgTileM) *
                       (double)(numWGs_N * wgTileN);
   double workUtil = ((double)mSize * nSize) / paddedArea;
@@ -433,7 +449,7 @@ static double evaluateSeedCandidate(
     workUtil = 0.01;
   }
 
-  // Step 6: Cache-aware roofline cost.
+  // Step 7: Cache-aware roofline cost.
   //
   // In a tiled GEMM, A[M,K] tiles are shared across all N-column WGs and
   // B[K,N] tiles across all M-row WGs.  When multiple WGs access the same
@@ -466,7 +482,7 @@ static double evaluateSeedCandidate(
   double compBound = flops / hw.peakFlopsPerSec;
   double iterCost = std::max(memBound, compBound);
 
-  // Step 7: Total predicted cost.
+  // Step 8: Total predicted cost.
   double totalCost = iterCost * kIters * (double)numWGs / workUtil;
 
   // Multi-wave penalty: when subgroupCount exceeds simdsPerWgp, each SIMD
@@ -474,6 +490,25 @@ static double evaluateSeedCandidate(
   // the SIMD's register file and instruction issue slots, reducing per-wave
   // ILP.  Multiply the cost by the number of waves per SIMD to capture this.
   totalCost *= (double)wavesPerSimdPerWG;
+
+  // Step 9: Occupancy-aware latency penalty.
+  //
+  // Low per-WGP occupancy limits the GPU's ability to hide memory latency:
+  // fewer concurrent WGs per WGP means fewer waves to overlap with memory
+  // accesses.  This primarily affects MediumGemm shapes (kTile=4) where
+  // large tiles push shared memory usage up and reduce achievable occupancy.
+  // LargeGemm shapes (kTile=1) typically have high occupancy regardless of
+  // tile size, so the penalty naturally doesn't apply to them.
+  //
+  // The penalty is 40% per occupancy level below the target of 3, calibrated
+  // to overcome the L2-cache model's ~28% bias toward larger tiles while
+  // preserving benefits for shapes with enough workgroups.
+  constexpr int64_t kTargetOccupancy = 3;
+  if (occupancy < kTargetOccupancy) {
+    double occPenalty =
+        1.0 + 0.4 * (double)(kTargetOccupancy - occupancy);
+    totalCost *= occPenalty;
+  }
 
   // Tie-break bias: slightly penalise higher subgroup counts so the search
   // prefers fewer, larger per-subgroup tiles when costs are equal.
