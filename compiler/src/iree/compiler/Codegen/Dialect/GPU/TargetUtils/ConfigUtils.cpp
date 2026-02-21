@@ -500,19 +500,22 @@ static double evaluateSeedCandidate(
   // LargeGemm shapes (kTile=1) typically have high occupancy regardless of
   // tile size, so the penalty naturally doesn't apply to them.
   //
-  // The penalty is 40% per occupancy level below the target of 3, calibrated
-  // to overcome the L2-cache model's ~28% bias toward larger tiles while
+  // The penalty is 45% per occupancy level below the target of 3, calibrated
+  // to overcome the L2-cache model's ~28-33% bias toward larger tiles while
   // preserving benefits for shapes with enough workgroups.
   constexpr int64_t kTargetOccupancy = 3;
   if (occupancy < kTargetOccupancy) {
     double occPenalty =
-        1.0 + 0.4 * (double)(kTargetOccupancy - occupancy);
+        1.0 + 0.45 * (double)(kTargetOccupancy - occupancy);
     totalCost *= occPenalty;
   }
 
-  // Tie-break bias: slightly penalise higher subgroup counts so the search
-  // prefers fewer, larger per-subgroup tiles when costs are equal.
+  // Tie-break biases: when costs are equal, prefer (1) fewer subgroups
+  // (better per-wave ILP) and (2) larger mnTileCount (fewer, bigger WGs
+  // with less dispatch overhead).  The subgroup bias (1e-6) dominates the
+  // mnTileCount bias (1e-7) so subgroup count is resolved first.
   totalCost *= (1.0 + 1e-6 * (double)subgroupCount);
+  totalCost *= (1.0 - 1e-7 * (double)mnTileCount);
 
   return totalCost;
 }
