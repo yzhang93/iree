@@ -351,11 +351,9 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
                               vgprsPerSimd};
 }
 
-/// Evaluate a single seed candidate using a roofline cost model.
-/// Returns a predicted cost (lower is better). All inputs come from either
-/// the problem dimensions or hardware specs -- zero tuning constants.
-/// Returns a very large cost if the candidate is infeasible (e.g., exceeds
-/// shared memory).
+/// Evaluate a single seed candidate using a cache-aware roofline cost model.
+/// Returns a predicted cost (lower is better). Returns a very large cost if the
+/// candidate is infeasible (e.g., exceeds shared memory or register limits).
 ///
 /// The model extends the classic roofline by incorporating:
 /// 1. **LDS-based occupancy**: How many concurrent workgroups can share each
@@ -363,16 +361,23 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
 /// 2. **Register-pressure occupancy**: MMA accumulator registers scale with
 ///    mnTileCount; large tiles reduce the number of concurrent waves.
 ///    Candidates that exceed the VGPR limit are rejected as infeasible.
-/// 3. **Bandwidth efficiency scaling**: At low occupancy the GPU cannot fully
-///    hide memory latency, so effective bandwidth is derated.  This prevents
-///    the model from blindly preferring maximum tile sizes.
+/// 3. **L2-cache-aware memory model**: In a tiled GEMM, A tiles are reused
+///    across N-columns of workgroups and B tiles across M-rows.  The L2 cache
+///    can serve repeated accesses, reducing effective HBM traffic.  We model
+///    this by dividing per-WG tile bytes by a reuse factor derived from the
+///    number of reuse opportunities, capped at a maximum to account for finite
+///    cache capacity.
+///
+/// Occupancy affects only the number of timesteps (how many concurrent WGs
+/// can run), not the effective memory bandwidth.  This avoids the over-
+/// penalisation of low-occupancy, high-kTile configs that empirically perform
+/// well.
 static double evaluateSeedCandidate(
     int64_t subgroupCount, int64_t mnTileCount, int64_t kTileCount,
     int64_t mSize, int64_t nSize, int64_t kSize, int64_t bytesPerElem,
     const RooflineHardwareInfo &hw, int64_t intrinsicM, int64_t intrinsicN,
     int64_t intrinsicK, int64_t splitReductionTripCnt = 0) {
   // Step 1: Estimate tile dimensions from seeds + intrinsic shape.
-  // Use the same sqrt-based distribution as getOptimalMMASchedule.
   int64_t sgSqrt = 1ull << llvm::divideCeil(llvm::Log2_64(subgroupCount), 2);
   int64_t tileSqrt = 1ull << (llvm::Log2_64(mnTileCount) / 2);
 
@@ -381,7 +386,6 @@ static double evaluateSeedCandidate(
       (subgroupCount / sgSqrt) * (mnTileCount / tileSqrt) * intrinsicN;
   int64_t wgTileK = kTileCount * intrinsicK;
 
-  // Ensure non-zero tile dimensions.
   if (wgTileM <= 0 || wgTileN <= 0 || wgTileK <= 0) {
     return std::numeric_limits<double>::max();
   }
@@ -394,20 +398,11 @@ static double evaluateSeedCandidate(
   }
 
   // Step 3: Occupancy estimation.
-  // 3a: LDS-based occupancy — how many WGs fit in shared memory per WGP.
+  // 3a: LDS-based occupancy.
   int64_t ldsOccupancy = hw.maxSharedMemoryBytes / std::max(sharedMemUsed, 1L);
 
-  // 3b: Register-based occupancy estimate.
-  // Each MMA tile (intrinsicM × intrinsicN) produces accumulator values that
-  // are distributed across subgroupSize threads. For f32 accumulators:
-  //   accVGPRs = mnTileCount * intrinsicM * intrinsicN / subgroupSize
+  // 3b: Register-based occupancy.
   int64_t accVGPRs = mnTileCount * intrinsicM * intrinsicN / hw.subgroupSize;
-  // Input operand VGPRs: each wave holds its A and B operands for the MMA.
-  // Per single MMA instruction, A needs (intrinsicM*intrinsicK/subgroupSize)
-  // elements and B needs (intrinsicK*intrinsicN/subgroupSize) elements,
-  // packed into 32-bit VGPRs. The wave reuses A across N-tiles and B across
-  // M-tiles, so multiply by mTile and nTile respectively.  We approximate
-  // mTile ≈ nTile ≈ sqrt(mnTileCount) since the exact split is unknown here.
   int64_t sqrtMN =
       std::max(1L, (int64_t)std::ceil(std::sqrt((double)mnTileCount)));
   int64_t aVGPRsPerMMA = llvm::divideCeil(
@@ -417,84 +412,76 @@ static double evaluateSeedCandidate(
   int64_t operandVGPRs = sqrtMN * (aVGPRsPerMMA + bVGPRsPerMMA);
   int64_t totalVGPRs = accVGPRs + operandVGPRs;
 
-  // Hard constraint: if a single wave cannot fit in one SIMD's register file,
-  // the compiler must spill registers to memory, causing catastrophic slowdown.
-  // Treat this the same as exceeding shared memory — the candidate is infeasible.
+  // Hard constraint: register spilling is catastrophic.
   if (totalVGPRs > hw.vgprsPerSimd) {
     return std::numeric_limits<double>::max();
   }
 
   int64_t waveLimitPerSimd = hw.vgprsPerSimd / std::max(totalVGPRs, 1L);
-
-  // 3c: Account for waves-per-WG. A WG with `subgroupCount` waves needs
-  // ceil(subgroupCount / simdsPerWgp) waves on each SIMD. This limits how
-  // many WGs can coexist on a WGP. For example, a WG with 8 subgroups on a
-  // 4-SIMD WGP needs 2 waves per SIMD, so at most floor(waveLimitPerSimd/2)
-  // WGs can run concurrently from a register perspective.
   int64_t wavesPerSimdPerWG = llvm::divideCeil(subgroupCount, hw.simdsPerWgp);
   int64_t regOccupancy =
       std::max(1L, waveLimitPerSimd / std::max(wavesPerSimdPerWG, 1L));
 
-  // Effective occupancy is the minimum of LDS-based and register-based,
-  // capped at a practical maximum.
   constexpr int64_t kMaxOccupancy = 10;
   int64_t occupancy =
       std::max(1L, std::min({ldsOccupancy, regOccupancy, kMaxOccupancy}));
 
-  // Step 4: Workgroup count and timesteps.
-  // When split-K reduction is active, the K dimension is distributed across
-  // splitReductionTripCnt workgroups, increasing total WG count and reducing
-  // the per-WG K iterations proportionally.
+  // For cost estimation, cap the effective occupancy.  Beyond ~2 concurrent
+  // WGs per WGP the marginal latency-hiding benefit is small, and the
+  // roofline model cannot capture this diminishing return.  Capping prevents
+  // the model from over-valuing tiny tiles with high occupancy.
+  constexpr int64_t kCostOccupancyCap = 2;
+  int64_t costOccupancy = std::min(occupancy, kCostOccupancyCap);
+
+  // Step 4: Workgroup count and K-loop iterations.
   int64_t splitK = splitReductionTripCnt > 1 ? splitReductionTripCnt : 1;
-  int64_t numWGs_MN =
-      llvm::divideCeil(mSize, wgTileM) * llvm::divideCeil(nSize, wgTileN);
-  int64_t numWGs = numWGs_MN * splitK;
-  // With occupancy O, the GPU can process O workgroups concurrently per WGP.
-  int64_t numTimesteps = llvm::divideCeil(numWGs, hw.wgpCount * occupancy);
+  int64_t numWGs_M = llvm::divideCeil(mSize, wgTileM);
+  int64_t numWGs_N = llvm::divideCeil(nSize, wgTileN);
+  int64_t numWGs = numWGs_M * numWGs_N * splitK;
+
+  int64_t effectiveK = llvm::divideCeil(kSize, splitK);
+  int64_t kIters = llvm::divideCeil(effectiveK, wgTileK);
+
+  // Occupancy determines how many WGs can run concurrently.
+  int64_t numTimesteps = llvm::divideCeil(numWGs, hw.wgpCount * costOccupancy);
 
   // Step 5: Work utilization (padding waste).
-  double paddedArea = (double)(llvm::divideCeil(mSize, wgTileM) * wgTileM) *
-                      (double)(llvm::divideCeil(nSize, wgTileN) * wgTileN);
+  double paddedArea = (double)(numWGs_M * wgTileM) *
+                      (double)(numWGs_N * wgTileN);
   double workUtil = ((double)mSize * nSize) / paddedArea;
-  // Clamp to avoid division by zero.
   if (workUtil < 0.01) {
     workUtil = 0.01;
   }
 
-  // Step 6: Roofline cost per K-iteration per workgroup.
-  double bytesLoaded = (double)(wgTileM + wgTileN) * wgTileK * bytesPerElem;
+  // Step 6: Cache-aware roofline cost per K-iteration per workgroup.
+  //
+  // In a tiled GEMM, A[M,K] tiles are shared across all N-column WGs and
+  // B[K,N] tiles across all M-row WGs.  When multiple WGs access the same
+  // tile, the L2 cache can serve subsequent accesses, reducing effective HBM
+  // traffic.  We model this by dividing each operand's bytes by its reuse
+  // count, capped at kMaxCacheReuse to account for finite cache capacity.
+  constexpr int64_t kMaxCacheReuse = 8;
+  double aReuse = std::min((double)numWGs_N, (double)kMaxCacheReuse);
+  double bReuse = std::min((double)numWGs_M, (double)kMaxCacheReuse);
+  double aBytes = (double)wgTileM * wgTileK * bytesPerElem;
+  double bBytes = (double)wgTileK * wgTileN * bytesPerElem;
+  double bytesLoaded = aBytes / std::max(aReuse, 1.0) +
+                       bBytes / std::max(bReuse, 1.0);
+
   double flops = 2.0 * wgTileM * wgTileN * wgTileK;
 
-  // Memory bandwidth and compute throughput are shared among all concurrent
-  // WGs on the chip. With occupancy O, there are wgpCount*O concurrent WGs.
-  double concurrentWGs = (double)hw.wgpCount * occupancy;
+  // Memory bandwidth and compute throughput are shared among concurrent WGs.
+  double concurrentWGs = (double)hw.wgpCount * costOccupancy;
   double memTime = bytesLoaded / (hw.memBandwidthBytesPerSec / concurrentWGs);
   double compTime = flops / (hw.peakFlopsPerSec / concurrentWGs);
-
-  // At low occupancy the GPU cannot fully hide memory latency, reducing
-  // effective bandwidth utilization.  The penalty ensures the *total* cost
-  // (iterCost × numTimesteps) correctly favours higher-occupancy configs:
-  //   totalCost ∝ bytesLoaded × numWGs / (bandwidth × bwEfficiency × occ)
-  // For occ < saturation this simplifies to ∝ 1/occ, so configs with more
-  // concurrent WGs (smaller tiles, higher occ) are rewarded.
-  constexpr int64_t kOccupancySaturation = 4;
-  double bwEfficiency =
-      std::min(1.0, (double)occupancy / kOccupancySaturation);
-  memTime /= bwEfficiency;
 
   double iterCost = std::max(memTime, compTime);
 
   // Step 7: Total predicted cost.
-  // Each WG processes K/splitK elements along the reduction dimension.
-  int64_t effectiveK = llvm::divideCeil(kSize, splitK);
-  int64_t kIters = llvm::divideCeil(effectiveK, wgTileK);
   double totalCost = iterCost * kIters * numTimesteps / workUtil;
 
-  // Tie-break bias: when different (subgroupCount, mnTileCount) pairs produce
-  // the same tile dimensions, their costs are (near-)identical.  Slightly
-  // penalise higher subgroup counts so the search consistently prefers fewer,
-  // larger per-subgroup tiles (e.g. sg=4/mn=16 over sg=8/mn=8).  The 1e-6
-  // multiplier is too small to change the ranking of genuinely different costs.
+  // Tie-break bias: slightly penalise higher subgroup counts so the search
+  // prefers fewer, larger per-subgroup tiles when costs are equal.
   totalCost *= (1.0 + 1e-6 * (double)subgroupCount);
 
   return totalCost;
@@ -502,11 +489,17 @@ static double evaluateSeedCandidate(
 
 /// Enumerate seed candidates and select the one with the lowest roofline cost
 /// for a specific intrinsic.
-/// The candidate space is: subgroupCount in {2, 4, 8},
-///                         mnTileCount in {2, 4, 8, 16, 32},
-///                         kTileCount in {1, 2, 4, 8}.
+/// The candidate space is: subgroupCount in {2, 4, 8} (filtered to >= simdsPerWgp),
+///                         mnTileCount in {2, 4, 8, 16},
+///                         kTileCount in {8, 4, 2} (descending).
 /// bestKElementCountPerSubgroup is derived from the chosen kTileCount and
 /// the intrinsic's K dimension.
+///
+/// kTileCounts are iterated in descending order so that when multiple configs
+/// produce the same cost (a common occurrence due to the cache model), the
+/// largest kTile wins.  Larger kTile means fewer K-loop iterations and thus
+/// less barrier synchronisation overhead — a real-world effect the roofline
+/// model cannot capture directly.
 ///
 /// When multiple candidates have equal cost, the tie-break favours fewer
 /// subgroups with more tiles per subgroup (matching the baseline pattern).
@@ -516,8 +509,8 @@ selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
                 int64_t intrinsicN, int64_t intrinsicK,
                 int64_t splitReductionTripCnt = 0) {
   static constexpr int64_t kSubgroupCounts[] = {2, 4, 8};
-  static constexpr int64_t kMNTileCounts[] = {2, 4, 8, 16, 32};
-  static constexpr int64_t kKTileCounts[] = {1, 2, 4, 8};
+  static constexpr int64_t kMNTileCounts[] = {2, 4, 8, 16};
+  static constexpr int64_t kKTileCounts[] = {8, 4, 2};
 
   int64_t bytesPerElem = inBitWidth / 8;
   if (bytesPerElem == 0) {
@@ -530,6 +523,11 @@ selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
   int64_t bestKTileCount = 2;
 
   for (int64_t sg : kSubgroupCounts) {
+    // Skip subgroup counts that leave SIMDs idle.  With sg < simdsPerWgp,
+    // some SIMDs in the WGP have no waves from this workgroup, wasting
+    // compute resources within the workgroup.
+    if (sg < hw.simdsPerWgp)
+      continue;
     for (int64_t mn : kMNTileCounts) {
       for (int64_t kt : kKTileCounts) {
         double cost = evaluateSeedCandidate(
