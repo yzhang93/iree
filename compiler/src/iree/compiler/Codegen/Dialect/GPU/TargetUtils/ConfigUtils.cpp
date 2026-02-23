@@ -381,7 +381,8 @@ static double evaluateSeedCandidate(
     int64_t subgroupCount, int64_t mnTileCount, int64_t kTileCount,
     int64_t mSize, int64_t nSize, int64_t kSize, int64_t bytesPerElem,
     const RooflineHardwareInfo &hw, int64_t intrinsicM, int64_t intrinsicN,
-    int64_t intrinsicK, int64_t splitReductionTripCnt = 0) {
+    int64_t intrinsicK, int64_t splitReductionTripCnt = 0,
+    bool isGemm = true) {
   // Step 1: Estimate tile dimensions from seeds + intrinsic shape.
   int64_t sgSqrt = 1ull << llvm::divideCeil(llvm::Log2_64(subgroupCount), 2);
   int64_t tileSqrt = 1ull << (llvm::Log2_64(mnTileCount) / 2);
@@ -485,11 +486,19 @@ static double evaluateSeedCandidate(
   // Step 8: Total predicted cost.
   double totalCost = iterCost * kIters * (double)numWGs / workUtil;
 
-  // Multi-wave penalty: when subgroupCount exceeds simdsPerWgp, each SIMD
-  // runs multiple waves from the same workgroup.  These waves compete for
-  // the SIMD's register file and instruction issue slots, reducing per-wave
-  // ILP.  Multiply the cost by the number of waves per SIMD to capture this.
-  totalCost *= (double)wavesPerSimdPerWG;
+  // Multi-wave penalty/bonus: when subgroupCount exceeds simdsPerWgp, each
+  // SIMD runs multiple waves from the same workgroup.
+  // For GEMM: these waves compete for register file and issue slots, reducing
+  // per-wave ILP.  Multiply the cost by the waves per SIMD to capture this.
+  // For convolutions: extra waves HELP hide the higher latency from
+  // irregular/strided memory access patterns (sliding window, grouped convs).
+  // Apply a 40% bonus per extra wave (calibrated to make sg=8 preferred over
+  // sg=4 for grouped convs without over-tileing standard convolutions).
+  if (isGemm) {
+    totalCost *= (double)wavesPerSimdPerWG;
+  } else {
+    totalCost /= (1.0 + 0.4 * (double)(wavesPerSimdPerWG - 1));
+  }
 
   // Step 9: Occupancy-aware latency penalty.
   //
@@ -500,21 +509,40 @@ static double evaluateSeedCandidate(
   // LargeGemm shapes (kTile=1) typically have high occupancy regardless of
   // tile size, so the penalty naturally doesn't apply to them.
   //
+  // For GEMM, the penalty uses raw WG-level occupancy because extra waves
+  // within a WG (from more subgroups) compete for register file and reduce
+  // per-wave ILP.
+  //
+  // For convolutions, wave-level concurrency matters more than WG-level
+  // occupancy: waves from the same WG (extra subgroups) effectively hide
+  // memory latency from strided/sliding-window access patterns.  So we use
+  // "effective occupancy" = occupancy * wavesPerSimdPerWG to avoid penalising
+  // configs that have fewer WGs but more waves within each WG.
+  //
   // The penalty is 45% per occupancy level below the target of 3, calibrated
   // to overcome the L2-cache model's ~28-33% bias toward larger tiles while
   // preserving benefits for shapes with enough workgroups.
-  constexpr int64_t kTargetOccupancy = 3;
-  if (occupancy < kTargetOccupancy) {
+  constexpr int64_t kGemmTargetOccupancy = 3;
+  constexpr int64_t kConvTargetOccupancy = 2;
+  int64_t effectiveOccupancy =
+      isGemm ? occupancy : occupancy * wavesPerSimdPerWG;
+  int64_t targetOcc = isGemm ? kGemmTargetOccupancy : kConvTargetOccupancy;
+  if (effectiveOccupancy < targetOcc) {
     double occPenalty =
-        1.0 + 0.45 * (double)(kTargetOccupancy - occupancy);
+        1.0 + 0.45 * (double)(targetOcc - effectiveOccupancy);
     totalCost *= occPenalty;
   }
 
-  // Tie-break biases: when costs are equal, prefer (1) fewer subgroups
-  // (better per-wave ILP) and (2) larger mnTileCount (fewer, bigger WGs
-  // with less dispatch overhead).  The subgroup bias (1e-6) dominates the
-  // mnTileCount bias (1e-7) so subgroup count is resolved first.
-  totalCost *= (1.0 + 1e-6 * (double)subgroupCount);
+  // Tie-break biases: when costs are equal, prefer larger mnTileCount
+  // (fewer, bigger WGs with less dispatch overhead).
+  // For GEMM: also prefer fewer subgroups (better per-wave ILP).
+  // For convolutions: prefer MORE subgroups (better latency hiding from
+  // irregular/strided memory patterns).
+  if (isGemm) {
+    totalCost *= (1.0 + 1e-6 * (double)subgroupCount);
+  } else {
+    totalCost *= (1.0 - 1e-6 * (double)subgroupCount);
+  }
   totalCost *= (1.0 - 1e-7 * (double)mnTileCount);
 
   return totalCost;
@@ -539,7 +567,8 @@ selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
                 const RooflineHardwareInfo &hw, int64_t intrinsicM,
                 int64_t intrinsicN, int64_t intrinsicK,
                 int64_t splitReductionTripCnt = 0,
-                GemmSize gemmSize = GemmSize::LargeGemm) {
+                GemmSize gemmSize = GemmSize::LargeGemm,
+                bool isGemm = true) {
   static constexpr int64_t kSubgroupCounts[] = {2, 4, 8};
   static constexpr int64_t kMNTileCounts[] = {2, 4, 8, 16};
 
@@ -576,58 +605,11 @@ selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
     for (int64_t mn : kMNTileCounts) {
       double cost = evaluateSeedCandidate(
           sg, mn, bestKTileCount, mSize, nSize, kSize, bytesPerElem, hw,
-          intrinsicM, intrinsicN, intrinsicK, splitReductionTripCnt);
+          intrinsicM, intrinsicN, intrinsicK, splitReductionTripCnt, isGemm);
       if (cost < bestCost) {
         bestCost = cost;
         bestSubgroupCount = sg;
         bestMNTileCount = mn;
-      }
-    }
-  }
-
-  // Post-search subgroup fixup: when the best config uses more subgroups than
-  // SIMDs per WGP, each SIMD must run multiple waves from the same workgroup.
-  // The cost model slightly favours this (due to less last-timestep waste) but
-  // in practice having fewer, larger per-wave tiles yields much better
-  // instruction-level parallelism (more MMA ops to interleave with loads).
-  // Replace with the equivalent config (same WG tile) that has at most
-  // simdsPerWgp subgroups.
-  if (bestSubgroupCount > hw.simdsPerWgp) {
-    int64_t totalTiles = bestSubgroupCount * bestMNTileCount;
-    // Search from the largest sg ≤ simdsPerWgp downward.
-    for (int64_t i = std::size(kSubgroupCounts); i-- > 0;) {
-      int64_t sg = kSubgroupCounts[i];
-      if (sg > hw.simdsPerWgp || sg >= bestSubgroupCount)
-        continue;
-      if (totalTiles % sg != 0)
-        continue;
-      int64_t mn = totalTiles / sg;
-      // Check mn is in the search space.
-      bool validMN = false;
-      for (int64_t m : kMNTileCounts) {
-        if (m == mn) {
-          validMN = true;
-          break;
-        }
-      }
-      if (!validMN)
-        continue;
-      // Quick feasibility check: per-wave VGPRs must fit in the register file.
-      int64_t acc = mn * intrinsicM * intrinsicN / hw.subgroupSize;
-      int64_t sqMN =
-          std::max(1L, (int64_t)std::ceil(std::sqrt((double)mn)));
-      int64_t aV = llvm::divideCeil(intrinsicM * intrinsicK * bytesPerElem,
-                                    hw.subgroupSize * 4);
-      int64_t bV = llvm::divideCeil(intrinsicK * intrinsicN * bytesPerElem,
-                                    hw.subgroupSize * 4);
-      if (acc + sqMN * (aV + bV) <= hw.vgprsPerSimd) {
-        LLVM_DEBUG(llvm::dbgs()
-                   << "[RooflineSeeds] Subgroup fixup: sg=" << bestSubgroupCount
-                   << "/mn=" << bestMNTileCount << " -> sg=" << sg
-                   << "/mn=" << mn << " (same WG tile, fewer subgroups)\n");
-        bestSubgroupCount = sg;
-        bestMNTileCount = mn;
-        break;
       }
     }
   }
@@ -849,16 +831,17 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
       int64_t inBitWidth = problem.aType.getIntOrFloatBitWidth();
       seedSelector =
           [hwInfo = *hwInfo, mSize, nSize, kSize, inBitWidth,
-           splitReductionTripCnt,
-           gemmSize = problem.gemmSize](const GPUMatmulShapeType & /*problem*/,
-                                        const GPUIntrinsicType &intrinsic) {
+           splitReductionTripCnt, gemmSize = problem.gemmSize,
+           isGemm](const GPUMatmulShapeType & /*problem*/,
+                   const GPUIntrinsicType &intrinsic) {
             LDBG() << "Roofline seed selection for intrinsic "
                    << intrinsic.mSizes[0] << "x" << intrinsic.nSizes[0] << "x"
-                   << intrinsic.kSizes[0];
+                   << intrinsic.kSizes[0]
+                   << (isGemm ? " (GEMM)" : " (conv)");
             return selectBestSeeds(mSize, nSize, kSize, inBitWidth, hwInfo,
                                    intrinsic.mSizes[0], intrinsic.nSizes[0],
                                    intrinsic.kSizes[0], splitReductionTripCnt,
-                                   gemmSize);
+                                   gemmSize, isGemm);
           };
     } else {
       llvm::errs()
