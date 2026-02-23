@@ -1301,6 +1301,17 @@ static iree_status_t iree_async_proactor_posix_submit_operation(
       // until the completion callback (async contract).
       iree_async_socket_send_operation_t* send_op =
           (iree_async_socket_send_operation_t*)operation;
+      // Fail immediately if the socket already has a sticky failure (e.g.,
+      // ECONNRESET from a prior recv). Without this, eager writev() deposits
+      // data in the kernel buffer and reports success even on broken
+      // connections, bypassing error detection entirely.
+      iree_status_t send_failure =
+          iree_async_socket_query_failure(send_op->socket);
+      if (!iree_status_is_ok(send_failure)) {
+        return iree_async_proactor_posix_complete_on_submit(
+            proactor, operation, iree_status_clone(send_failure),
+            IREE_ASYNC_COMPLETION_FLAG_NONE);
+      }
       iree_async_proactor_posix_materialize_iovecs(
           (struct iovec*)send_op->platform.posix.iovecs, &send_op->buffers);
       iree_async_io_result_t send_result = IREE_ASYNC_IO_COMPLETE;
@@ -1332,6 +1343,13 @@ static iree_status_t iree_async_proactor_posix_submit_operation(
       // On EAGAIN, defer to poll loop for POLLOUT-driven retry.
       iree_async_socket_sendto_operation_t* sendto_op =
           (iree_async_socket_sendto_operation_t*)operation;
+      iree_status_t sendto_failure =
+          iree_async_socket_query_failure(sendto_op->socket);
+      if (!iree_status_is_ok(sendto_failure)) {
+        return iree_async_proactor_posix_complete_on_submit(
+            proactor, operation, iree_status_clone(sendto_failure),
+            IREE_ASYNC_COMPLETION_FLAG_NONE);
+      }
       iree_async_proactor_posix_materialize_iovecs(
           (struct iovec*)sendto_op->platform.posix.iovecs, &sendto_op->buffers);
       iree_async_io_result_t sendto_result = IREE_ASYNC_IO_COMPLETE;

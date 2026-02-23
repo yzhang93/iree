@@ -160,28 +160,52 @@ iree_cc_library(
   PUBLIC
 )
 
-set(_all_tests_platform_deps "")
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  list(APPEND _all_tests_platform_deps ::relay_windows_test)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  list(APPEND _all_tests_platform_deps ::fence_posix_test)
-  list(APPEND _all_tests_platform_deps ::relay_posix_test)
-else()
-  list(APPEND _all_tests_platform_deps ::fence_posix_test)
-  list(APPEND _all_tests_platform_deps ::relay_posix_test)
-endif()
 iree_cc_library(
   NAME
-    all_tests
+    notification_tests
   DEPS
     ::cancellation_test
     ::notification_test
+    ::signal_test
+  TESTONLY
+  PUBLIC
+)
+
+set(_platform_tests_platform_deps "")
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  list(APPEND _platform_tests_platform_deps ::relay_windows_test)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND _platform_tests_platform_deps ::fence_posix_test)
+  list(APPEND _platform_tests_platform_deps ::relay_posix_test)
+else()
+  list(APPEND _platform_tests_platform_deps ::fence_posix_test)
+  list(APPEND _platform_tests_platform_deps ::relay_posix_test)
+endif()
+iree_cc_library(
+  NAME
+    platform_tests
+  DEPS
+    ${_platform_tests_platform_deps}
+  TESTONLY
+  PUBLIC
+)
+
+iree_cc_library(
+  NAME
+    relay_tests
+  DEPS
     ::relay_test
+  TESTONLY
+  PUBLIC
+)
+
+iree_cc_library(
+  NAME
+    semaphore_tests
+  DEPS
     ::semaphore_async_test
     ::semaphore_linked_test
     ::semaphore_sync_test
-    ::signal_test
-    ${_all_tests_platform_deps}
   TESTONLY
   PUBLIC
 )
