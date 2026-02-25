@@ -327,7 +327,12 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
 
   // Convert units: TFLOPS -> FLOP/s, Tbps -> bytes/s.
   float peakFlopsPerSec = peakTflops * 1e12f;
-  float memBandwidthBytesPerSec = memBandwidthTbps * 1e12f / 8.0f;
+  // The attribute is named "Tbps" but the stored values are in TB/s
+  // (terabytes per second).  E.g., MI355X stores 8.0 for 8 TB/s bandwidth.
+  // The existing `computeMemoryCutoff = TFLOPS / TB/s` at line ~247 correctly
+  // treats this as TB/s (TFLOPS / TB/s = FLOPS/byte).  We follow the same
+  // convention:  TB/s * 1e12 = bytes/s.
+  float memBandwidthBytesPerSec = memBandwidthTbps * 1e12f;
 
   auto wgp = target.getWgp();
   int64_t maxSharedMemBytes = wgp.getMaxWorkgroupMemoryBytes();
@@ -578,8 +583,17 @@ static double evaluateSeedCandidate(
   } else {
     totalCost *= (1.0 - 1e-6 * (double)subgroupCount);
   }
-  // Prefer larger mnTileCount (fewer, bigger WGs with less dispatch overhead).
-  totalCost *= (1.0 - 1e-7 * (double)mnTileCount);
+  // Prefer larger mnTileCount (fewer, bigger WGs).  For compute-bound shapes,
+  // larger tiles have better data reuse and instruction-level parallelism.
+  // Scale the preference inversely with memory-boundedness:
+  //   - Compute-bound (memBoundFrac→0): up to ~1% per mn unit, strong enough
+  //     to overcome the small occupancy benefit from effOcc.
+  //   - Memory-bound (memBoundFrac→1): ~0%, so occupancy scaling dominates.
+  // This is critical for RDNA4-class hardware where the VGPR cliff between
+  // regOcc=1 and regOcc=2 creates a ~2% occupancy advantage for smaller tiles,
+  // overwhelming the negligible 1e-7 tie-break bias.
+  double tileSizeBias = 1e-7 + (1.0 - memBoundFrac) * 1e-2;
+  totalCost *= (1.0 - tileSizeBias * (double)mnTileCount);
   // Prefer larger kTileCount (fewer K-iterations, better instruction
   // scheduling and reduced loop overhead).
   totalCost *= (1.0 - 1e-8 * (double)kTileCount);
