@@ -515,8 +515,17 @@ static double evaluateSeedCandidate(
   // When the problem is globally compute-bound (globalAI >> ridge), the ALU
   // pipeline is the bottleneck and higher occupancy can't increase throughput.
   // We weight the occupancy benefit by how memory-bound the problem is:
-  //   memBoundFrac = min(1, ridgePoint / globalAI)
+  //   memBoundFrac = min(1, ridgePoint / globalAI)^2
   //   effOcc = 1 + (rawEffOcc - 1) * memBoundFrac
+  //
+  // The squaring is critical: for compute-bound GEMMs, iterCost * kIters *
+  // numWGs is mathematically tile-independent (total work is constant).  Even
+  // a tiny effOcc advantage from smaller tiles (e.g., 13% at memBoundFrac=0.1)
+  // would dominate the negligible tie-break biases and incorrectly prefer
+  // smaller tiles.  Squaring compresses the transition region:
+  //   memBoundFrac_raw = 0.1 → 0.01  (negligible: compute-bound)
+  //   memBoundFrac_raw = 0.5 → 0.25  (moderate)
+  //   memBoundFrac_raw = 1.0 → 1.0   (full: memory-bound, unchanged)
   //
   // This is general across hardware: GPUs with different ridge points
   // automatically get different effective occupancy scaling.
@@ -525,7 +534,8 @@ static double evaluateSeedCandidate(
                      1e-10);
   double ridgePoint =
       (double)hw.peakFlopsPerSec / ((double)hw.memBandwidthBytesPerSec + 1e-10);
-  double memBoundFrac = std::min(1.0, ridgePoint / (globalAI + 1e-10));
+  double memBoundFracRaw = std::min(1.0, ridgePoint / (globalAI + 1e-10));
+  double memBoundFrac = memBoundFracRaw * memBoundFracRaw;
 
   double rawEffOcc;
   if (isGemm) {
@@ -880,11 +890,10 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
                                    gemmSize, isGemm);
           };
     } else {
-      llvm::errs()
-          << "ERROR: Roofline seed selection enabled but hardware info "
-             "incomplete (missing chip attributes?). Aborting to prevent "
-             "silent fallback to hardcoded seeds.\n";
-      return std::nullopt;
+      LDBG() << "Roofline seed selection enabled but hardware info "
+                "unavailable (target has no chip attributes). "
+                "Falling back to default hardcoded seeds.";
+      // seedSelector stays nullopt → deduceMMASchedule uses default seeds.
     }
   }
 
