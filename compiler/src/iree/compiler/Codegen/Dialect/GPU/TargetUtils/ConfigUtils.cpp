@@ -361,14 +361,21 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
 /// where memTime and compTime model the per-WG per-K-iter roofline bounds
 /// and numTimesteps = numWGs / (wgpCount * effOcc).
 ///
-/// ## Occupancy scaling
-/// For GEMM: effOcc = sqrt(regOcc), modelling diminishing returns of
-/// register-based occupancy.
-/// For convolutions: effOcc = min(sqrt(regOcc * wavesPerSimdPerWG), 2.0).
-/// Convolutions benefit from wave-level parallelism (multiple waves per SIMD
-/// hide irregular/strided memory latency), so the effective occupancy accounts
-/// for both WG-level occupancy and multi-wave concurrency.  The cap at 2.0
-/// prevents over-valuing very high wave counts (memory pipeline saturates).
+/// ## Global arithmetic intensity weighting
+/// The per-WG model misses L2 cache reuse across WGs (A-tiles shared along N,
+/// B-tiles shared along M).  For large GEMMs this reuse makes the global
+/// problem compute-bound even though individual WGs are memory-bound per
+/// K-iteration.  We compute globalAI = 2*M*N / ((M+N)*bpe) and compare to the
+/// machine's ridge point (peakFlops / bandwidth).  When compute-bound
+/// (globalAI >> ridge), occupancy can't increase throughput, so the occupancy
+/// benefit is attenuated:
+///   memBoundFrac = min(1, ridgePoint / globalAI)
+///   effOcc = 1 + (rawEffOcc - 1) * memBoundFrac
+///
+/// ## Sublinear occupancy scaling
+/// For GEMM: rawEffOcc = sqrt(regOcc).
+/// For convolutions: rawEffOcc = sqrt(regOcc * wavesPerSimdPerWG).
+/// Both are then weighted by memBoundFrac (see above).
 ///
 /// ## Fractional kIters
 /// K-loop iterations are computed as `(double)effectiveK / wgTileK` (floating-
@@ -376,18 +383,12 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
 /// exactly kTile-independent, ensuring the tie-break bias correctly prefers
 /// larger kTile values without ceiling artifacts.
 ///
-/// ## Work utilization for convolutions
-/// For convolutions, workUtil is softened to sqrt(rawWorkUtil).  This reduces
-/// the penalty for padding waste when N (output channels per group) is small,
-/// which often forces large N-dimension tiles with low utilization.  Empirically,
-/// convolutions compensate for padding waste through better latency hiding
-/// with larger WG tiles.
-///
 /// Key features:
 /// 1. **Shared-memory feasibility**: Rejects candidates exceeding LDS capacity.
 /// 2. **Register-pressure feasibility**: Rejects candidates whose per-SIMD
 ///    VGPR demand (accounting for multi-wave) exceeds the hardware limit.
-/// 3. **Sublinear occupancy scaling**: Adapts to GEMM vs convolution workloads.
+/// 3. **Global AI-weighted occupancy**: General across hardware; GPUs with
+///    different ridge points automatically get different occupancy scaling.
 /// 4. **Multi-wave penalty (GEMM only)**: Penalizes configs where
 ///    subgroupCount > simdsPerWgp.  Conv uses wave-level occupancy instead.
 /// 5. **Tie-break biases**: Prefer sg closest to simdsPerWgp (GEMM) or more
@@ -500,27 +501,43 @@ static double evaluateSeedCandidate(
   double compTime = flopsVal / (hw.peakFlopsPerSec / hw.wgpCount);
   double iterCost = std::max(memTime, compTime);
 
-  // Step 8: Total predicted cost with sublinear occupancy scaling.
+  // Step 8: Total predicted cost with memory-boundedness-weighted occupancy.
   //
-  // GEMM: effOcc = sqrt(regOcc).  Models diminishing returns of register-based
-  // occupancy — sqrt compresses the advantage of very high regOcc while
-  // preserving the penalty for regOcc=1.
+  // The per-WG roofline model treats each WG's K-loop independently, missing
+  // L2 cache reuse across WGs (A-tiles shared along N, B-tiles shared along M).
+  // For large GEMMs, this reuse makes the global problem compute-bound even
+  // though individual WGs are memory-bound per K-iteration.
   //
-  // Conv: effOcc = sqrt(regOcc * wavesPerSimdPerWG).
-  // Convolutions benefit from wave-level parallelism (multiple waves per SIMD
-  // hide irregular/strided memory access latency).  Using regOcc * wavesPerSimd
-  // counts total concurrent waves per SIMD, not just concurrent WGs.
-  // No cap is applied: the effective-tile clipping in Step 7 already equalizes
-  // the per-WG cost for grouped convolutions, so the uncapped effOcc is the
-  // primary mechanism for the model to prefer higher-subgroup-count configs
-  // that provide better latency hiding.
-  double effOcc;
+  // We compute the global arithmetic intensity:
+  //   globalAI = 2*M*N / ((M+N) * bytesPerElem)   [K cancels out]
+  // and compare to the machine's ridge point (peakFlops / bandwidth).
+  //
+  // When the problem is globally compute-bound (globalAI >> ridge), the ALU
+  // pipeline is the bottleneck and higher occupancy can't increase throughput.
+  // We weight the occupancy benefit by how memory-bound the problem is:
+  //   memBoundFrac = min(1, ridgePoint / globalAI)
+  //   effOcc = 1 + (rawEffOcc - 1) * memBoundFrac
+  //
+  // This is general across hardware: GPUs with different ridge points
+  // automatically get different effective occupancy scaling.
+  double globalAI = 2.0 * (double)mSize * (double)nSize /
+                    (((double)mSize + (double)nSize) * (double)bytesPerElem +
+                     1e-10);
+  double ridgePoint =
+      (double)hw.peakFlopsPerSec / ((double)hw.memBandwidthBytesPerSec + 1e-10);
+  double memBoundFrac = std::min(1.0, ridgePoint / (globalAI + 1e-10));
+
+  double rawEffOcc;
   if (isGemm) {
-    effOcc = std::sqrt((double)regOcc);
+    rawEffOcc = std::sqrt((double)regOcc);
   } else {
     double wavesPerSimd = (double)(regOcc * wavesPerSimdPerWG);
-    effOcc = std::sqrt(wavesPerSimd);
+    rawEffOcc = std::sqrt(wavesPerSimd);
   }
+  // Weight occupancy benefit by global memory-boundedness.
+  // Compute-bound (memBoundFrac→0): effOcc→1 (occupancy doesn't help).
+  // Memory-bound (memBoundFrac=1): effOcc=rawEffOcc (full benefit).
+  double effOcc = 1.0 + (rawEffOcc - 1.0) * memBoundFrac;
   double concurrentWGs = (double)hw.wgpCount * effOcc;
   double numTimesteps = (double)numWGs / concurrentWGs;
   double totalCost = iterCost * kIters * numTimesteps / workUtil;
