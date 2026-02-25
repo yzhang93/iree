@@ -351,31 +351,47 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
                               vgprsPerSimd};
 }
 
-/// Evaluate a single seed candidate using a cache-aware roofline cost model.
+/// Evaluate a single seed candidate using an occupancy-aware roofline model.
 /// Returns a predicted cost (lower is better). Returns a very large cost if the
 /// candidate is infeasible (e.g., exceeds shared memory or register limits).
 ///
-/// The model is:
-///   cost = max(memBound, compBound) * kIters * numWGs / workUtil * penalties
+/// The model computes:
+///   cost = max(memTime, compTime) * kIters * numTimesteps / workUtil
+///
+/// where memTime and compTime model the per-WG per-K-iter roofline bounds
+/// and numTimesteps = numWGs / (wgpCount * effOcc).
+///
+/// ## Occupancy scaling
+/// For GEMM: effOcc = sqrt(regOcc), modelling diminishing returns of
+/// register-based occupancy.
+/// For convolutions: effOcc = min(sqrt(regOcc * wavesPerSimdPerWG), 2.0).
+/// Convolutions benefit from wave-level parallelism (multiple waves per SIMD
+/// hide irregular/strided memory latency), so the effective occupancy accounts
+/// for both WG-level occupancy and multi-wave concurrency.  The cap at 2.0
+/// prevents over-valuing very high wave counts (memory pipeline saturates).
+///
+/// ## Fractional kIters
+/// K-loop iterations are computed as `(double)effectiveK / wgTileK` (floating-
+/// point division) instead of integer ceiling.  This makes iterCost * kIters
+/// exactly kTile-independent, ensuring the tie-break bias correctly prefers
+/// larger kTile values without ceiling artifacts.
+///
+/// ## Work utilization for convolutions
+/// For convolutions, workUtil is softened to sqrt(rawWorkUtil).  This reduces
+/// the penalty for padding waste when N (output channels per group) is small,
+/// which often forces large N-dimension tiles with low utilization.  Empirically,
+/// convolutions compensate for padding waste through better latency hiding
+/// with larger WG tiles.
 ///
 /// Key features:
-/// 1. **Shared-memory feasibility**: Candidates whose LDS usage exceeds the
-///    WGP's shared memory are rejected.
-/// 2. **Register-pressure feasibility**: Candidates whose per-SIMD VGPR demand
-///    (accounting for multiple waves per SIMD) exceeds the hardware limit are
-///    rejected.
-/// 3. **Occupancy computation**: Per-WGP occupancy from LDS and register
-///    constraints determines the GPU's latency-hiding ability.
-/// 4. **L2-cache-aware memory model**: A tiles are reused across N-columns of
-///    workgroups and B tiles across M-rows, reducing effective HBM traffic.
-/// 5. **Bandwidth efficiency scaling**: At low occupancy, the GPU can't fully
-///    hide memory latency.  The effective bandwidth is modeled as
-///    1/(1 + adaptiveOccSat/occupancy), where the saturation constant adapts
-///    to hardware VGPR capacity.  This makes the cost kTile-sensitive for
-///    memory-bound shapes while having no effect on compute-bound shapes.
-/// 6. **Register-based occupancy penalty**: Configs with low register-based
-///    occupancy (independent of kTile/LDS) are penalized.  The target adapts
-///    to hardware: min(dynamicTarget, maxTarget).
+/// 1. **Shared-memory feasibility**: Rejects candidates exceeding LDS capacity.
+/// 2. **Register-pressure feasibility**: Rejects candidates whose per-SIMD
+///    VGPR demand (accounting for multi-wave) exceeds the hardware limit.
+/// 3. **Sublinear occupancy scaling**: Adapts to GEMM vs convolution workloads.
+/// 4. **Multi-wave penalty (GEMM only)**: Penalizes configs where
+///    subgroupCount > simdsPerWgp.  Conv uses wave-level occupancy instead.
+/// 5. **Tie-break biases**: Prefer sg closest to simdsPerWgp (GEMM) or more
+///    subgroups (conv), larger mnTileCount, and larger kTileCount.
 static double evaluateSeedCandidate(
     int64_t subgroupCount, int64_t mnTileCount, int64_t kTileCount,
     int64_t mSize, int64_t nSize, int64_t kSize, int64_t bytesPerElem,
@@ -403,6 +419,11 @@ static double evaluateSeedCandidate(
   }
 
   // Step 3: Register feasibility check.
+  //
+  // Estimate VGPRs: accumulator registers + operand (A/B) registers.
+  // When subgroupCount > simdsPerWgp, multiple waves share a SIMD's register
+  // file.  If the total demand exceeds the hardware capacity, the candidate
+  // would cause register spilling — catastrophically slow.
   int64_t accVGPRs = mnTileCount * intrinsicM * intrinsicN / hw.subgroupSize;
   int64_t sqrtMN =
       std::max(1L, (int64_t)std::ceil(std::sqrt((double)mnTileCount)));
@@ -413,153 +434,111 @@ static double evaluateSeedCandidate(
   int64_t operandVGPRs = sqrtMN * (aVGPRsPerMMA + bVGPRsPerMMA);
   int64_t totalVGPRs = accVGPRs + operandVGPRs;
 
-  // Hard constraint: all waves sharing a SIMD share its register file.
-  // With more subgroups than SIMDs, each SIMD runs multiple waves whose
-  // per-wave VGPRs stack up.  If the total exceeds the SIMD's capacity,
-  // the hardware spills to scratch memory — catastrophically slow.
   int64_t wavesPerSimdPerWG = llvm::divideCeil(subgroupCount, hw.simdsPerWgp);
   if (totalVGPRs * wavesPerSimdPerWG > hw.vgprsPerSimd) {
     return std::numeric_limits<double>::max();
   }
 
-  // Step 4: Achievable occupancy (WGs per WGP).
-  //
-  // Two separate occupancy values are tracked:
-  //   - combinedOcc: min(LDS, register) — the actual concurrent WG count,
-  //     used for bandwidth efficiency scaling.
-  //   - regOcc: register-only occupancy — independent of kTile/LDS choices,
-  //     used for the occupancy penalty (which should capture register/subgroup
-  //     efficiency, not kTile effects).
-  int64_t ldsOcc = hw.maxSharedMemoryBytes / std::max(sharedMemUsed, 1L);
-  int64_t maxWavesPerSimd = hw.vgprsPerSimd / std::max(totalVGPRs, 1L);
-  int64_t regOcc = maxWavesPerSimd / std::max(wavesPerSimdPerWG, 1L);
-  int64_t combinedOcc = std::max(1L, std::min(ldsOcc, regOcc));
-
-  // Compute dynamic occupancy target from a reference config (mn=8).
-  // This is used for both bwEfficiency and the penalty, ensuring the model
-  // adapts to hardware VGPR capacity without explicit per-hardware branches.
-  //   - MI355X (512 VGPRs, 32x32x16): dynamicTarget = 3
-  //   - RDNA4  (256 VGPRs, 16x16x16): dynamicTarget = 2
-  int64_t refAccVGPRs = 8 * intrinsicM * intrinsicN / hw.subgroupSize;
-  int64_t refSqrtMN = 3; // ceil(sqrt(8))
-  int64_t refOperandVGPRs = refSqrtMN * (aVGPRsPerMMA + bVGPRsPerMMA);
-  int64_t refTotalVGPRs = refAccVGPRs + refOperandVGPRs;
-  int64_t dynamicTarget =
-      std::max(1L, hw.vgprsPerSimd / std::max(refTotalVGPRs, 1L));
-
-  // Step 5: Workgroup count and K-loop iterations.
+  // Step 4: Workgroup count and K-loop iterations.
   int64_t splitK = splitReductionTripCnt > 1 ? splitReductionTripCnt : 1;
   int64_t numWGs_M = llvm::divideCeil(mSize, wgTileM);
   int64_t numWGs_N = llvm::divideCeil(nSize, wgTileN);
   int64_t numWGs = numWGs_M * numWGs_N * splitK;
 
-  int64_t effectiveK = llvm::divideCeil(kSize, splitK);
-  int64_t kIters = llvm::divideCeil(effectiveK, wgTileK);
+  double effectiveK = (double)llvm::divideCeil(kSize, splitK);
+  // Fractional kIters: avoids integer ceiling artifacts that create
+  // artificial kTile preferences.  With fractional division,
+  // iterCost * kIters = (memOrCompPerElement * wgTileK) * (effectiveK / wgTileK)
+  //                   = memOrCompPerElement * effectiveK   (kTile-independent)
+  double kIters = effectiveK / (double)wgTileK;
 
-  // Step 6: Work utilization (padding waste).
-  double paddedArea = (double)(numWGs_M * wgTileM) *
-                      (double)(numWGs_N * wgTileN);
-  double workUtil = ((double)mSize * nSize) / paddedArea;
-  if (workUtil < 0.01) {
-    workUtil = 0.01;
+  // Step 5: Work utilization (padding waste).
+  //
+  // For GEMM: standard 2D padding waste (M and N dimensions).
+  // For convolutions: only M-dimension padding is penalized.  The N-dimension
+  // (output channels per group) is handled via effective-tile clipping in
+  // Step 7, which already removes the N-padding bias from iterCost.
+  // This is critical for grouped convolutions where N is small (e.g., 56 for
+  // g=16 with c=896): without this, the model over-penalizes configs with
+  // larger wgTileN, incorrectly favoring fewer subgroups.
+  double workUtil;
+  if (isGemm) {
+    double paddedArea = (double)(numWGs_M * wgTileM) *
+                        (double)(numWGs_N * wgTileN);
+    workUtil = ((double)mSize * nSize) / paddedArea;
+  } else {
+    double paddedM = (double)(numWGs_M * wgTileM);
+    workUtil = (double)mSize / paddedM;
   }
+  workUtil = std::max(workUtil, 0.01);
 
-  // Step 7: Cache-aware roofline cost.
+  // Step 6: Register-based occupancy.
   //
-  // In a tiled GEMM, A[M,K] tiles are shared across all N-column WGs and
-  // B[K,N] tiles across all M-row WGs.  When multiple WGs access the same
-  // tile, the L2 cache can serve subsequent accesses, reducing effective HBM
-  // traffic.  We model this by dividing each operand's bytes by its reuse
-  // count, capped at kMaxCacheReuse to account for finite cache capacity.
+  // How many WGs can run concurrently per WGP, limited by register pressure.
+  int64_t maxWavesPerSimd = hw.vgprsPerSimd / std::max(totalVGPRs, 1L);
+  int64_t regOcc = maxWavesPerSimd / std::max(wavesPerSimdPerWG, 1L);
+  regOcc = std::max(regOcc, 1L);
+
+  // Step 7: Roofline cost per K-iteration per workgroup.
   //
-  // The cost is computed as:
-  //   totalCost = max(memBound, compBound) * kIters * numWGs / workUtil
-  // where memBound and compBound are the per-WG per-K-iteration roofline
-  // bounds.  Note: we intentionally use *fractional* WG counts rather than
-  // ceiling-based timesteps.  This is because for memory-bound GEMMs the
-  // total HBM traffic (bytesLoaded * kIters) is constant regardless of
-  // kTileCount.  Integer-ceiling timesteps create artificial cost differences
-  // between kTile values (due to last-timestep waste), which don't reflect
-  // real hardware performance.  Fractional counts make the cost kTile-
-  // independent for memory-bound shapes, correctly delegating kTile selection
-  // to the iteration-order tie-break (ascending = smallest kTile first).
-  constexpr int64_t kMaxCacheReuse = 8;
-  double aReuse = std::min((double)numWGs_N, (double)kMaxCacheReuse);
-  double bReuse = std::min((double)numWGs_M, (double)kMaxCacheReuse);
-  double aBytes = (double)wgTileM * wgTileK * bytesPerElem;
-  double bBytes = (double)wgTileK * wgTileN * bytesPerElem;
-  double bytesLoaded = aBytes / std::max(aReuse, 1.0) +
-                       bBytes / std::max(bReuse, 1.0);
+  // Each WGP gets 1/wgpCount of the total bandwidth and compute.
+  //
+  // For convolutions: clip the effective N-tile to min(wgTileN, nSize).
+  // Grouped convolutions have small N (channels-per-group), so different
+  // subgroup counts produce different wgTileN values but the same effective
+  // N-work per WG (bounded by nSize).  Clipping equalizes the per-WG cost
+  // across configs, letting the occupancy model (not padding waste) drive
+  // the choice.  For non-grouped convolutions (N >> wgTileN), the clipping
+  // has no effect.
+  double effTileN = isGemm ? (double)wgTileN
+                           : std::min((double)wgTileN, (double)nSize);
+  double bytesLoaded =
+      ((double)wgTileM + effTileN) * (double)wgTileK * bytesPerElem;
+  double flopsVal = 2.0 * (double)wgTileM * effTileN * (double)wgTileK;
 
-  double flops = 2.0 * wgTileM * wgTileN * wgTileK;
+  double memTime = bytesLoaded / (hw.memBandwidthBytesPerSec / hw.wgpCount);
+  double compTime = flopsVal / (hw.peakFlopsPerSec / hw.wgpCount);
+  double iterCost = std::max(memTime, compTime);
 
-  double memBound = bytesLoaded / hw.memBandwidthBytesPerSec;
-  double compBound = flops / hw.peakFlopsPerSec;
+  // Step 8: Total predicted cost with sublinear occupancy scaling.
+  //
+  // GEMM: effOcc = sqrt(regOcc).  Models diminishing returns of register-based
+  // occupancy — sqrt compresses the advantage of very high regOcc while
+  // preserving the penalty for regOcc=1.
+  //
+  // Conv: effOcc = sqrt(regOcc * wavesPerSimdPerWG).
+  // Convolutions benefit from wave-level parallelism (multiple waves per SIMD
+  // hide irregular/strided memory access latency).  Using regOcc * wavesPerSimd
+  // counts total concurrent waves per SIMD, not just concurrent WGs.
+  // No cap is applied: the effective-tile clipping in Step 7 already equalizes
+  // the per-WG cost for grouped convolutions, so the uncapped effOcc is the
+  // primary mechanism for the model to prefer higher-subgroup-count configs
+  // that provide better latency hiding.
+  double effOcc;
+  if (isGemm) {
+    effOcc = std::sqrt((double)regOcc);
+  } else {
+    double wavesPerSimd = (double)(regOcc * wavesPerSimdPerWG);
+    effOcc = std::sqrt(wavesPerSimd);
+  }
+  double concurrentWGs = (double)hw.wgpCount * effOcc;
+  double numTimesteps = (double)numWGs / concurrentWGs;
+  double totalCost = iterCost * kIters * numTimesteps / workUtil;
 
-  // Bandwidth efficiency: at low occupancy, the GPU can't fully hide memory
-  // latency, reducing effective bandwidth.  The saturation constant is
-  // hardware-adaptive: scaled by 1/dynamicTarget so that hardware with more
-  // VGPRs (higher dynamicTarget, better latency hiding) has a flatter curve.
-  //   MI355X (dynamicTarget=3): adaptiveOccSat=1.33, bwEff@occ=1 = 0.43
-  //   RDNA4  (dynamicTarget=2): adaptiveOccSat=2.00, bwEff@occ=1 = 0.33
-  // This makes the model kTile-sensitive for memory-bound shapes (different
-  // kTile → different LDS occupancy → different bandwidth efficiency) while
-  // having no effect on compute-bound shapes (where compBound dominates).
-  constexpr double kBaseOccSat = 4.0;
-  double adaptiveOccSat = kBaseOccSat / (double)dynamicTarget;
-  double bwEfficiency =
-      1.0 / (1.0 + adaptiveOccSat / std::max((double)combinedOcc, 1.0));
-  double adjustedMemBound = memBound / bwEfficiency;
-  double iterCost = std::max(adjustedMemBound, compBound);
-
-  // Step 8: Total predicted cost.
-  double totalCost = iterCost * kIters * (double)numWGs / workUtil;
-
-  // Multi-wave penalty/bonus: when subgroupCount exceeds simdsPerWgp, each
-  // SIMD runs multiple waves from the same workgroup.
+  // Step 9: Multi-wave penalty (GEMM only).
+  //
+  // When subgroupCount exceeds simdsPerWgp, each SIMD runs multiple waves
+  // from the same workgroup.
   // For GEMM: these waves compete for register file and issue slots, reducing
-  // per-wave ILP.  Multiply the cost by the waves per SIMD to capture this.
-  // For convolutions: extra waves HELP hide the higher latency from
-  // irregular/strided memory access patterns (sliding window, grouped convs).
-  // Apply a 40% bonus per extra wave (calibrated to make sg=8 preferred over
-  // sg=4 for grouped convs without over-tileing standard convolutions).
+  // per-wave ILP.  Penalize proportionally to the number of extra waves.
+  // For convolutions: the wave-level occupancy in Step 8 already accounts for
+  // the benefit of multi-wave configs (via regOcc * wavesPerSimdPerWG in
+  // effOcc), so no explicit bonus is needed.
   if (isGemm) {
     totalCost *= (double)wavesPerSimdPerWG;
-  } else {
-    totalCost /= (1.0 + 0.4 * (double)(wavesPerSimdPerWG - 1));
   }
 
-  // Step 9: Register-based occupancy penalty.
-  //
-  // This penalty captures configs that are inherently register-inefficient
-  // (too many VGPRs per wave due to large mnTileCount or multiple waves per
-  // SIMD).  It uses **register-based** occupancy (regOcc), NOT combined
-  // occupancy, so it's independent of kTile/LDS effects — those are handled
-  // by the bwEfficiency scaling in Step 7.
-  //
-  // The target is hardware-adaptive: min(dynamicTarget, maxTarget).
-  //   - MI355X (dynamicTarget=3): target=3, penalizes configs with regOcc<3
-  //   - RDNA4  (dynamicTarget=2): target=2, penalizes configs with regOcc<2
-  // No boolean gate — the adaptive target naturally makes the penalty weaker
-  // on VGPR-limited hardware where low reg occupancy is unavoidable.
-  //
-  // For GEMM: uses raw WG-level register occupancy.
-  // For conv: uses wave-level occupancy (regOcc * wavesPerSimdPerWG)
-  //   because extra subgroups help hide strided/sliding-window latency.
-  constexpr int64_t kMaxGemmTargetOccupancy = 3;
-  constexpr int64_t kConvTargetOccupancy = 2;
-
-  int64_t penaltyOcc =
-      isGemm ? regOcc : regOcc * wavesPerSimdPerWG;
-  int64_t targetOcc = isGemm ? std::min(dynamicTarget, kMaxGemmTargetOccupancy)
-                              : std::min(dynamicTarget, kConvTargetOccupancy);
-  if (penaltyOcc < targetOcc) {
-    double occPenalty =
-        1.0 + 0.45 * (double)(targetOcc - penaltyOcc);
-    totalCost *= occPenalty;
-  }
-
-  // Tie-break biases (negligible magnitude, only affect exact ties).
+  // Step 10: Tie-break biases (negligible magnitude, only affect near-ties).
   //
   // Subgroup count: For GEMM, prefer subgroupCount closest to simdsPerWgp
   // (fills all SIMDs without multi-wave register sharing overhead).
@@ -585,12 +564,12 @@ static double evaluateSeedCandidate(
 /// for a specific intrinsic.
 /// The candidate space is: subgroupCount in {2, 4, 8},
 ///                         mnTileCount in {2, 4, 8, 16},
-///                         kTileCount in {2, 4, 8} (capped by GemmSize max).
+///                         kTileCount in {1, 2, 4, 8} (capped by GemmSize max).
 ///
 /// All values are searched uniformly — no hardware-specific filters.  The cost
-/// model naturally adapts to different hardware through:
-///   - bwEfficiency scaling (adaptive saturation from dynamicTarget)
-///   - Register-based occupancy penalty (adaptive target from dynamicTarget)
+/// model adapts to different hardware through:
+///   - VGPR feasibility check (uses hw.vgprsPerSimd, hw.simdsPerWgp)
+///   - Multi-wave penalty/bonus (uses hw.simdsPerWgp)
 ///   - SIMD-distance tie-break (uses hw.simdsPerWgp)
 ///
 /// When multiple candidates have equal cost, tie-breaks prefer:
@@ -605,7 +584,7 @@ selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
                 bool isGemm = true) {
   static constexpr int64_t kSubgroupCounts[] = {2, 4, 8};
   static constexpr int64_t kMNTileCounts[] = {2, 4, 8, 16};
-  static constexpr int64_t kKTileCounts[] = {2, 4, 8};
+  static constexpr int64_t kKTileCounts[] = {1, 2, 4, 8};
 
   int64_t bytesPerElem = inBitWidth / 8;
   if (bytesPerElem == 0) {
@@ -633,8 +612,8 @@ selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
   int64_t bestKTileCount = 2;
 
   // Uniform search over all (sg, mn, kTile) combinations.  No hardware-
-  // specific filters — the cost model adapts through bwEfficiency scaling,
-  // register-based penalty, and SIMD-distance tie-breaks.
+  // specific filters — the cost model adapts through VGPR feasibility checks,
+  // multi-wave penalty/bonus, and SIMD-distance tie-breaks.
   for (int64_t sg : kSubgroupCounts) {
     for (int64_t mn : kMNTileCounts) {
       for (int64_t kt : kKTileCounts) {
