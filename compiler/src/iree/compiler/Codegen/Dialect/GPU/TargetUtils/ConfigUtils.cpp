@@ -361,17 +361,25 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
 /// Returns a predicted cost (lower is better). Returns infinity if the
 /// candidate is infeasible (exceeds shared memory or register limits).
 ///
-/// The model has 6 steps:
+/// The model has 7 steps:
 ///   1. Tile dimensions (from seeds + intrinsic shape)
 ///   2. Feasibility filters (LDS + VGPRs) and occupancy
 ///   3. Workgroup count & K-iterations (fractional)
 ///   4. Per-WG roofline cost with bandwidth efficiency
 ///   5. Multi-wave penalty (GEMM only)
-///   6. Tie-break biases
+///   6. ILP bias for compute-bound tiles
+///   7. Tie-break biases
 ///
-/// Heuristic constant (only 1):
+/// Heuristic constants (3):
 ///   - Bandwidth saturation rate = 2.0 in exp(-regOcc / 2.0)
 ///     Models how GPU memory bandwidth saturates with occupancy.
+///   - ILP bias magnitude = 1e-2 per sqrt(mn-tile) unit.
+///     For compute-bound tiles, larger tiles have better instruction-level
+///     parallelism and less workgroup scheduling overhead.  Uses sqrt to
+///     model diminishing returns from increasingly large tiles.
+///   - Occupancy steady-state rate = 10.0 in exp(-numTimesteps / 10.0)
+///     For short-running kernels (few timesteps), occupancy is less
+///     critical; for long-running kernels it fully determines throughput.
 ///
 /// All other parameters are derived from hardware or problem shape.
 static double evaluateSeedCandidate(
@@ -486,9 +494,36 @@ static double evaluateSeedCandidate(
     totalCost *= (double)wavesPerSimdPerWG;
   }
 
-  // ── Step 6: Tie-break biases ──────────────────────────────────────────
+  // ── Step 6: ILP bias for compute-bound tiles ─────────────────────────
+  //
+  // When a tile is compute-bound (compTime > memTime), all tile sizes that
+  // produce the same total FLOPs have ~equal cost.  Larger tiles provide
+  // better instruction-level parallelism and less WG scheduling overhead.
+  //
+  // The bias is modulated by three factors:
+  //   (a) sqrt(mnTileCount): diminishing returns from increasingly large
+  //       tiles (vs. linear in previous version).
+  //   (b) effectiveBwEff: at low occupancy, the hardware cannot sustain
+  //       the ILP benefit because pipeline bubbles dominate.
+  //   (c) occupancyWeight: for short-running kernels (few timesteps), the
+  //       GPU never reaches steady state, so occupancy is less critical.
+  //       Smoothly ramps from 0 to 1 as numTimesteps increases.
+  //
+  // This prevents catastrophic tile-size choices on hardware with limited
+  // VGPRs (e.g., RDNA4 at 256 VGPRs/SIMD, where mn=16 gives regOcc=1)
+  // for large shapes, while preserving the ILP benefit for small/medium
+  // shapes and hardware with ample registers (e.g., MI355X at 512
+  // VGPRs/SIMD, where mn=16 still has regOcc=5).
+  double compFrac = compTime / (memTime + compTime + 1e-30);
+  double occupancyWeight = 1.0 - std::exp(-numTimesteps / 10.0);
+  double effectiveBwEff =
+      1.0 - (1.0 - bwEfficiency) * occupancyWeight;
+  totalCost *= (1.0 - compFrac * 1e-2 *
+                           std::sqrt((double)mnTileCount) * effectiveBwEff);
 
-  // 6a. Subgroup count preference.
+  // ── Step 7: Tie-break biases ──────────────────────────────────────────
+
+  // 7a. Subgroup count preference.
   // GEMM: prefer sg closest to simdsPerWgp (1 wave/SIMD, max ILP).
   // Conv: prefer more subgroups (better latency hiding for strided access).
   if (isGemm) {
@@ -499,7 +534,7 @@ static double evaluateSeedCandidate(
     totalCost *= (1.0 - 1e-6 * (double)subgroupCount);
   }
 
-  // 6b. Prefer larger kTile (fewer K-loop iterations, less loop overhead).
+  // 7b. Prefer larger kTile (fewer K-loop iterations, less loop overhead).
   totalCost *= (1.0 - 1e-8 * (double)kTileCount);
 
   return totalCost;
