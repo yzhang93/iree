@@ -357,23 +357,21 @@ extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
                               vgprsPerSimd};
 }
 
-/// Evaluate a single seed candidate using a 7-step occupancy-aware roofline
-/// model. Returns a predicted cost (lower is better). Returns infinity if the
+/// Evaluate a single seed candidate using an occupancy-aware roofline model.
+/// Returns a predicted cost (lower is better). Returns infinity if the
 /// candidate is infeasible (exceeds shared memory or register limits).
 ///
-/// The 7 steps are:
+/// The model has 6 steps:
 ///   1. Tile dimensions (from seeds + intrinsic shape)
 ///   2. Feasibility filters (LDS + VGPRs) and occupancy
 ///   3. Workgroup count & K-iterations (fractional)
-///   4. Per-WG roofline cost (with N-clipping for conv)
-///   5. Total cost with AI-weighted occupancy
-///   6. Multi-wave penalty (GEMM only)
-///   7. Tie-break biases
+///   4. Per-WG roofline cost with bandwidth efficiency
+///   5. Multi-wave penalty (GEMM only)
+///   6. Tie-break biases
 ///
-/// Heuristic constants (only 2):
-///   - memBoundFrac exponent = 2 (compresses compute/memory transition)
-///   - ILP bias magnitude = 1e-2 (overcomes occupancy advantage for
-///     compute-bound shapes)
+/// Heuristic constant (only 1):
+///   - Bandwidth saturation rate = 2.0 in exp(-regOcc / 2.0)
+///     Models how GPU memory bandwidth saturates with occupancy.
 ///
 /// All other parameters are derived from hardware or problem shape.
 static double evaluateSeedCandidate(
@@ -425,7 +423,7 @@ static double evaluateSeedCandidate(
     return std::numeric_limits<double>::max();
   }
 
-  // 2c. Register-based occupancy (used in Step 5).
+  // 2c. Register-based occupancy (used in Step 4 bandwidth efficiency).
   int64_t maxWavesPerSimd = hw.vgprsPerSimd / std::max(totalVGPRs, 1L);
   int64_t regOcc = maxWavesPerSimd / std::max(wavesPerSimdPerWG, 1L);
   regOcc = std::max(regOcc, 1L);
@@ -441,7 +439,7 @@ static double evaluateSeedCandidate(
   // artifacts that create artificial kTile preferences.
   double kIters = effectiveK / (double)wgTileK;
 
-  // ── Step 4: Per-WG roofline cost ──────────────────────────────────────
+  // ── Step 4: Per-WG roofline cost with bandwidth efficiency ─────────────
   //
   // For conv: clip effective N-tile to min(wgTileN, nSize).  Grouped
   // convolutions have small N (channels-per-group), so different subgroup
@@ -452,65 +450,45 @@ static double evaluateSeedCandidate(
       ((double)wgTileM + effTileN) * (double)wgTileK * bytesPerElem;
   double flopsVal = 2.0 * (double)wgTileM * effTileN * (double)wgTileK;
 
+  // Bandwidth efficiency: GPU memory subsystem can only achieve peak
+  // bandwidth when enough waves are in flight to hide latency.  Model
+  // as a saturating exponential of occupancy (the single heuristic constant).
+  //   regOcc=1: 39%  regOcc=2: 63%  regOcc=4: 87%  regOcc=8: 98%
+  // For convolutions, use wave-level occupancy (regOcc * wavesPerSimdPerWG)
+  // to capture latency hiding from irregular/strided memory access.
+  double occForBw;
+  if (isGemm) {
+    occForBw = (double)regOcc;
+  } else {
+    occForBw = (double)(regOcc * wavesPerSimdPerWG);
+  }
+  double bwEfficiency = 1.0 - std::exp(-occForBw / 2.0);
+  bwEfficiency = std::max(bwEfficiency, 0.1); // floor to avoid extreme values
+
   // Each WGP gets 1/wgpCount of the total bandwidth and compute.
-  double memTime = bytesLoaded / (hw.memBandwidthBytesPerSec / hw.wgpCount);
+  // Scale memory time by inverse bandwidth efficiency.
+  double memTime =
+      bytesLoaded / (hw.memBandwidthBytesPerSec / hw.wgpCount) / bwEfficiency;
   double compTime = flopsVal / (hw.peakFlopsPerSec / hw.wgpCount);
   double iterCost = std::max(memTime, compTime);
 
-  // ── Step 5: Total cost with AI-weighted occupancy ─────────────────────
-  //
-  // Global arithmetic intensity determines whether occupancy can help.
-  // When the problem is globally compute-bound (globalAI >> ridge), the ALU
-  // is the bottleneck and higher occupancy can't increase throughput.
-  // Bytes include A (M*K), B (K*N), and C (M*N) — matching the existing
-  // computeIntensity formula: flops / (M*N + N*K + M*K).
-  double globalBytes =
-      ((double)mSize * (double)nSize + (double)nSize * (double)kSize +
-       (double)mSize * (double)kSize) *
-      (double)bytesPerElem;
-  double globalFlops = 2.0 * (double)mSize * (double)nSize * (double)kSize;
-  double globalAI = globalFlops / (globalBytes + 1e-10);
-  double ridgePoint =
-      (double)hw.peakFlopsPerSec / ((double)hw.memBandwidthBytesPerSec + 1e-10);
-  double memBoundFracRaw = std::min(1.0, ridgePoint / (globalAI + 1e-10));
-  // Squaring compresses the transition region:
-  //   raw=0.1 → 0.01  (compute-bound: occupancy negligible)
-  //   raw=0.5 → 0.25  (moderate)
-  //   raw=1.0 → 1.0   (memory-bound: full occupancy benefit)
-  double memBoundFrac = memBoundFracRaw * memBoundFracRaw;
-
-  // Effective occupancy with sublinear (sqrt) scaling for diminishing returns.
-  // GEMM:  rawEffOcc = sqrt(regOcc)
-  // Conv:  rawEffOcc = sqrt(regOcc * wavesPerSimdPerWG) — wave-level
-  //        occupancy captures latency hiding from irregular memory access.
-  double rawEffOcc;
-  if (isGemm) {
-    rawEffOcc = std::sqrt((double)regOcc);
-  } else {
-    double wavesPerSimd = (double)(regOcc * wavesPerSimdPerWG);
-    rawEffOcc = std::sqrt(wavesPerSimd);
-  }
-  // Weight occupancy benefit by global memory-boundedness.
-  double effOcc = 1.0 + (rawEffOcc - 1.0) * memBoundFrac;
-
-  double concurrentWGs = (double)hw.wgpCount * effOcc;
-  double numTimesteps = (double)numWGs / concurrentWGs;
-  // No workUtil division — padding waste is already captured by
-  // iterCost * numWGs (numWGs includes ceil-based padding).
+  // Total cost: simple timestep model (no occupancy in timesteps —
+  // occupancy is already captured in bandwidth efficiency).
+  double numTimesteps = (double)numWGs / (double)hw.wgpCount;
   double totalCost = iterCost * kIters * numTimesteps;
 
-  // ── Step 6: Multi-wave penalty (GEMM only) ────────────────────────────
+  // ── Step 5: Multi-wave penalty (GEMM only) ────────────────────────────
   //
   // When sg > simdsPerWgp, multiple waves share each SIMD, competing for
   // ALU and issue slots. For GEMM this reduces per-wave ILP.
-  // For conv: wave-level occupancy in Step 5 already captures the benefit.
+  // For conv: wave-level occupancy in Step 4 already captures the benefit.
   if (isGemm) {
     totalCost *= (double)wavesPerSimdPerWG;
   }
 
-  // ── Step 7: Tie-break biases ──────────────────────────────────────────
+  // ── Step 6: Tie-break biases ──────────────────────────────────────────
 
-  // 7a. Subgroup count preference.
+  // 6a. Subgroup count preference.
   // GEMM: prefer sg closest to simdsPerWgp (1 wave/SIMD, max ILP).
   // Conv: prefer more subgroups (better latency hiding for strided access).
   if (isGemm) {
@@ -521,14 +499,7 @@ static double evaluateSeedCandidate(
     totalCost *= (1.0 - 1e-6 * (double)subgroupCount);
   }
 
-  // 7b. Tile-size + ILP bias (adaptive, the 2nd heuristic constant).
-  // Compute-bound (memBoundFrac→0): up to ~1% per mn unit — strong enough
-  // to overcome the small occupancy benefit from effOcc.
-  // Memory-bound (memBoundFrac→1): ~0%, so occupancy scaling dominates.
-  double tileSizeBias = 1e-7 + (1.0 - memBoundFrac) * 1e-2;
-  totalCost *= (1.0 - tileSizeBias * (double)mnTileCount);
-
-  // 7c. Prefer larger kTile (fewer K-loop iterations, less loop overhead).
+  // 6b. Prefer larger kTile (fewer K-loop iterations, less loop overhead).
   totalCost *= (1.0 - 1e-8 * (double)kTileCount);
 
   return totalCost;
