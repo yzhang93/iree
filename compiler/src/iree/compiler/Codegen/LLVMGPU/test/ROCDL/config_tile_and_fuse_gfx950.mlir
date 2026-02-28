@@ -299,3 +299,72 @@ func.func @scaled_matmul_accumulate(
 // CHECK-REMARKS: [Analysis] SharedMemoryUsage
 // CHECK-REMARKS-SAME: Category:deduceMMASchedule
 // CHECK-REMARKS-SAME: Remark=157184
+
+// -----
+
+// M-heavy matmul: M=1200 (tile count 75=3*5^2, no pow2 factors), N=16.
+// GCD-based distribution fails to assign tiles to M. The imbalanced-problem
+// heuristic redirects remaining tiles to M via min-based distribution.
+#map_m_lhs = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map_m_rhs = affine_map<(d0, d1, d2) -> (d1, d2)>
+#map_m_out = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @m_heavy_matmul(%lhs: tensor<1200x2048xf16>, %rhs: tensor<16x2048xf16>) -> tensor<1200x16xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %empty = tensor.empty() : tensor<1200x16xf32>
+  %fill = linalg.fill ins(%cst : f32) outs(%empty : tensor<1200x16xf32>) -> tensor<1200x16xf32>
+  %result = linalg.generic {
+    indexing_maps = [#map_m_lhs, #map_m_rhs, #map_m_out],
+    iterator_types = ["parallel", "parallel", "reduction"]
+  } ins(%lhs, %rhs : tensor<1200x2048xf16>, tensor<16x2048xf16>) outs(%fill : tensor<1200x16xf32>) {
+  ^bb0(%in: f16, %in_0: f16, %out: f32):
+    %0 = arith.extf %in : f16 to f32
+    %1 = arith.extf %in_0 : f16 to f32
+    %2 = arith.mulf %0, %1 : f32
+    %3 = arith.addf %2, %out : f32
+    linalg.yield %3 : f32
+  } -> tensor<1200x16xf32>
+  return %result : tensor<1200x16xf32>
+}
+
+// CHECK-LABEL: func.func @m_heavy_matmul
+//  CHECK-SAME:   #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [128, 1, 1] subgroup_size = 64
+//       CHECK:   linalg.generic {{.*}}lowering_config = #iree_gpu.lowering_config
+//  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F16>
+//  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     reduction = [0, 0, 4]
+//  CHECK-SAME:     subgroup = [4, 1, 0]
+//  CHECK-SAME:     workgroup = [128, 16, 0]
+
+// -----
+
+// N-heavy matmul: M=16, N=1200 (tile count 75=3*5^2, no pow2 factors).
+// Symmetric to M-heavy: remaining tiles redirected to N.
+#map_n_lhs = affine_map<(d0, d1, d2) -> (d0, d2)>
+#map_n_rhs = affine_map<(d0, d1, d2) -> (d1, d2)>
+#map_n_out = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @n_heavy_matmul(%lhs: tensor<16x2048xf16>, %rhs: tensor<1200x2048xf16>) -> tensor<16x1200xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %empty = tensor.empty() : tensor<16x1200xf32>
+  %fill = linalg.fill ins(%cst : f32) outs(%empty : tensor<16x1200xf32>) -> tensor<16x1200xf32>
+  %result = linalg.generic {
+    indexing_maps = [#map_n_lhs, #map_n_rhs, #map_n_out],
+    iterator_types = ["parallel", "parallel", "reduction"]
+  } ins(%lhs, %rhs : tensor<16x2048xf16>, tensor<1200x2048xf16>) outs(%fill : tensor<16x1200xf32>) {
+  ^bb0(%in: f16, %in_0: f16, %out: f32):
+    %0 = arith.extf %in : f16 to f32
+    %1 = arith.extf %in_0 : f16 to f32
+    %2 = arith.mulf %0, %1 : f32
+    %3 = arith.addf %2, %out : f32
+    linalg.yield %3 : f32
+  } -> tensor<16x1200xf32>
+  return %result : tensor<16x1200xf32>
+}
+
+// CHECK-LABEL: func.func @n_heavy_matmul
+//  CHECK-SAME:   #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [128, 1, 1] subgroup_size = 64
+//       CHECK:   linalg.generic {{.*}}lowering_config = #iree_gpu.lowering_config
+//  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F16>
+//  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     reduction = [0, 0, 4]
+//  CHECK-SAME:     subgroup = [1, 4, 0]
+//  CHECK-SAME:     workgroup = [16, 128, 0]

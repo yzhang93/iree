@@ -510,6 +510,43 @@ static GPUMMASchedule getOptimalMMASchedule(const GPUMatmulShapeType &problem,
   // dimension. This is likely because assigning leftover factors often results
   // in overly aggressive tiling that ended up reducing occupancy and increasing
   // shared memory usage.
+  //
+  // However, for heavily imbalanced problems (one dim >> the other), the
+  // GCD-based distribution often fails to assign any tiles to the dominant
+  // dimension because its tile count (e.g., 75 for F=2376/32) has no common
+  // factors with the power-of-2 tile budget. In such cases, assign the
+  // remaining tiles to the starved dimension using min-based distribution.
+  // Only do this when the remaining tiles would actually increase the tile
+  // size — don't replace a larger value from sqrt/GCD with a smaller one.
+  // Examples:
+  //   M-heavy (backward weight conv: M=F >> N=C): remaining tiles → M
+  //   N-heavy (analogous case where N >> M):      remaining tiles → N
+  bool useMinForM = mTotalTileCounts.back() >= 4 * nTotalTileCounts.back();
+  bool useMinForN = nTotalTileCounts.back() >= 4 * mTotalTileCounts.back();
+  if (useMinForM && remainingTiles > 1) {
+    int64_t newMTile =
+        std::min(remainingTiles, mTotalTileToDistribute);
+    if (newMTile > mTileSizeDistributed) {
+      LDBG() << "M-heavy: assigning remaining tiles (" << remainingTiles
+             << ") to M (innermost M tiles: " << mTotalTileCounts.back()
+             << " >= 4 * innermost N tiles: " << nTotalTileCounts.back()
+             << "), mTile: " << mTileSizeDistributed << " -> " << newMTile;
+      remainingTiles /= (newMTile / mTileSizeDistributed);
+      mTileSizeDistributed = newMTile;
+    }
+  } else if (useMinForN && remainingTiles > 1) {
+    int64_t newNTile =
+        std::min(remainingTiles, nTotalTileToDistribute);
+    if (newNTile > nTileSizeDistributed) {
+      LDBG() << "N-heavy: assigning remaining tiles (" << remainingTiles
+             << ") to N (innermost N tiles: " << nTotalTileCounts.back()
+             << " >= 4 * innermost M tiles: " << mTotalTileCounts.back()
+             << "), nTile: " << nTileSizeDistributed << " -> " << newNTile;
+      remainingTiles /= (newNTile / nTileSizeDistributed);
+      nTileSizeDistributed = newNTile;
+    }
+  }
+
   LDBG() << "Leftover factors: subgroups: " << remainingSubgroups
          << ", tiles: " << remainingTiles;
   LDBG() << "Collapsed subgroup counts: M: " << mSubgroupDistributed
@@ -523,19 +560,47 @@ static GPUMMASchedule getOptimalMMASchedule(const GPUMatmulShapeType &problem,
       nTileSizes(problem.nSizes.size(), 0);
 
   // Distribute collapsed tile to M dims from inner -> outer.
+  // Use min-based distribution for the dominant dimension in imbalanced
+  // problems, since GCD fails for non-power-of-2 tile counts.
   for (size_t e = problem.mSizes.size(), i = e - 1; i < e; --i) {
-    mSubgroupCounts[i] =
-        distributeTilesUsingGCD(mTotalTileCounts[i], mSubgroupDistributed);
-    mTileSizes[i] =
-        distributeTilesUsingGCD(mTotalTileCounts[i], mTileSizeDistributed);
+    if (useMinForM) {
+      mSubgroupCounts[i] =
+          std::min(mSubgroupDistributed, mTotalTileCounts[i]);
+      mTotalTileCounts[i] =
+          llvm::divideCeil(mTotalTileCounts[i], mSubgroupCounts[i]);
+      mSubgroupDistributed /= mSubgroupCounts[i];
+
+      mTileSizes[i] = std::min(mTileSizeDistributed, mTotalTileCounts[i]);
+      mTotalTileCounts[i] =
+          llvm::divideCeil(mTotalTileCounts[i], mTileSizes[i]);
+      mTileSizeDistributed /= mTileSizes[i];
+    } else {
+      mSubgroupCounts[i] =
+          distributeTilesUsingGCD(mTotalTileCounts[i], mSubgroupDistributed);
+      mTileSizes[i] =
+          distributeTilesUsingGCD(mTotalTileCounts[i], mTileSizeDistributed);
+    }
   }
 
   // Distribute collapsed tile to N dims from inner -> outer.
   for (size_t e = problem.nSizes.size(), i = e - 1; i < e; --i) {
-    nSubgroupCounts[i] =
-        distributeTilesUsingGCD(nTotalTileCounts[i], nSubgroupDistributed);
-    nTileSizes[i] =
-        distributeTilesUsingGCD(nTotalTileCounts[i], nTileSizeDistributed);
+    if (useMinForN) {
+      nSubgroupCounts[i] =
+          std::min(nSubgroupDistributed, nTotalTileCounts[i]);
+      nTotalTileCounts[i] =
+          llvm::divideCeil(nTotalTileCounts[i], nSubgroupCounts[i]);
+      nSubgroupDistributed /= nSubgroupCounts[i];
+
+      nTileSizes[i] = std::min(nTileSizeDistributed, nTotalTileCounts[i]);
+      nTotalTileCounts[i] =
+          llvm::divideCeil(nTotalTileCounts[i], nTileSizes[i]);
+      nTileSizeDistributed /= nTileSizes[i];
+    } else {
+      nSubgroupCounts[i] =
+          distributeTilesUsingGCD(nTotalTileCounts[i], nSubgroupDistributed);
+      nTileSizes[i] =
+          distributeTilesUsingGCD(nTotalTileCounts[i], nTileSizeDistributed);
+    }
   }
 
   SmallVector<int64_t> kTileSizes =
@@ -551,8 +616,10 @@ static GPUMMASchedule getOptimalMMASchedule(const GPUMatmulShapeType &problem,
 ///   dimension of the problem.
 ///   2) M/N-alignment. We prefer intrinsics that can evenly divide the M
 ///   and N dimensions of the problem.
-///   3) Intrinsic with larger gemm size.
-///   4) Intrinsic with larger K size.
+///   3) Intrinsic with larger gemm input size.
+///   4) For M-heavy problems with multi-dim N (backward weight conv):
+///      intrinsic with larger M*N output tile.
+///   5) Intrinsic with larger K size.
 ///
 /// This function acts as a comparison function object for std::sort, which
 /// returns true if the lhs is ordered before rhs.
@@ -588,6 +655,26 @@ static bool compareIntrinsics(const GPUMatmulShapeType &problem,
   int64_t rhsArea = intrinsicArea(rhs);
   if (lhsArea != rhsArea) {
     return lhsArea > rhsArea;
+  }
+
+  // For M-heavy problems with multi-dimensional N (e.g., backward weight
+  // convolution where N = [kH, kW, C] and M = [F] with F >> C), prefer
+  // intrinsics with larger M*N output tile to maximize data reuse.
+  // This favors e.g. 32x32x16 over 16x16x32 when area is the same.
+  // The conditions ensure this only fires for backward weight conv shapes:
+  //   - nSizes.size() > 1: excludes forward conv, matmul, and attention
+  //   - mInnermost > 4 * nInnermost: ensures F >> C (M-heavy)
+  int64_t mInnermost = problem.mSizes.back();
+  int64_t nInnermost = problem.nSizes.back();
+  if (problem.nSizes.size() > 1 && nInnermost > 0 &&
+      mInnermost > 4 * nInnermost) {
+    int64_t lhsMN = ShapedType::getNumElements(lhs.mSizes) *
+                    ShapedType::getNumElements(lhs.nSizes);
+    int64_t rhsMN = ShapedType::getNumElements(rhs.mSizes) *
+                    ShapedType::getNumElements(rhs.nSizes);
+    if (lhsMN != rhsMN) {
+      return lhsMN > rhsMN;
+    }
   }
 
   // Finally if everything else is the same, prefer large K size.
