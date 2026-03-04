@@ -272,9 +272,9 @@ getGemmHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth, bool scaled) {
     }
     return GPUMMAHeuristicSeeds(
         {/*bestSubgroupCountPerWorkgroup=*/4,
-         /*bestMNTileCountPerSubgroup=*/8,
+         /*bestMNTileCountPerSubgroup=*/4,
          /*bestKTileCountPerSubgroup=*/4,
-         /*bestKElementCountPerSubgroup=*/2 * kCacheLineSizeBits / inBitWidth});
+         /*bestKElementCountPerSubgroup=*/kCacheLineSizeBits / inBitWidth});
   case GemmSize::LargeGemm:
     if (scaled) {
       return GPUMMAHeuristicSeeds(
@@ -285,10 +285,10 @@ getGemmHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth, bool scaled) {
                inBitWidth});
     }
     return GPUMMAHeuristicSeeds(
-        {/*bestSubgroupCountPerWorkgroup=*/4,
+        {/*bestSubgroupCountPerWorkgroup=*/8,
          /*bestMNTileCountPerSubgroup=*/16,
-         /*bestKTileCountPerSubgroup=*/2,
-         /*bestKElementCountPerSubgroup=*/kCacheLineSizeBits / 2 / inBitWidth});
+         /*bestKTileCountPerSubgroup=*/4,
+         /*bestKElementCountPerSubgroup=*/kCacheLineSizeBits / inBitWidth});
   default:
     assert(false && "Unhandled gemm size");
     return std::nullopt;
@@ -306,18 +306,16 @@ getConvolutionHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth) {
          /*bestKElementCountPerSubgroup=*/kCacheLineSizeBits / inBitWidth});
   case GemmSize::MediumGemm:
     return GPUMMAHeuristicSeeds(
-        {/*bestSubgroupCountPerWorkgroup=*/8,
+        {/*bestSubgroupCountPerWorkgroup=*/4,
          /*bestMNTileCountPerSubgroup=*/4,
          /*bestKTileCountPerSubgroup=*/4,
-         /*bestKElementCountPerSubgroup=*/2 * kCacheLineSizeBits / inBitWidth});
+         /*bestKElementCountPerSubgroup=*/kCacheLineSizeBits / inBitWidth});
   case GemmSize::LargeGemm:
-    // Favor more subgroups for convolution to help latency hiding from global
-    // loads.
     return GPUMMAHeuristicSeeds(
-        {/*bestSubgroupCountPerWorkgroup=*/8,
+        {/*bestSubgroupCountPerWorkgroup=*/4,
          /*bestMNTileCountPerSubgroup=*/8,
-         /*bestKTileCountPerSubgroup=*/2,
-         /*bestKElementCountPerSubgroup=*/kCacheLineSizeBits / 2 / inBitWidth});
+         /*bestKTileCountPerSubgroup=*/4,
+         /*bestKElementCountPerSubgroup=*/kCacheLineSizeBits / inBitWidth});
   default:
     assert(false && "Unhandled convolution gemm size");
     return std::nullopt;
