@@ -664,6 +664,23 @@ static bool compareIntrinsics(const GPUMatmulShapeType &problem,
     return lhsArea > rhsArea;
   }
 
+  // For imbalanced GEMMs where M or N dominates K, prefer intrinsics with
+  // larger compute throughput (e.g., 32x32x16 over 16x16x32). Using the
+  // full product of all M/N/K dimensions (not just the innermost) so that
+  // multi-dimensional problems are evaluated by their true total size.
+  int64_t mSize = ShapedType::getNumElements(problem.mSizes);
+  int64_t nSize = ShapedType::getNumElements(problem.nSizes);
+  int64_t kSize = ShapedType::getNumElements(problem.kSizes);
+
+  bool imbalancedGemm = (mSize > 12 * kSize || nSize > 12 * kSize);
+  if (problem.gemmSize == GemmSize::LargeGemm && imbalancedGemm) {
+    int64_t lhsCompute = intrinsicCompute(lhs);
+    int64_t rhsCompute = intrinsicCompute(rhs);
+    if (lhsCompute != rhsCompute) {
+      return lhsCompute > rhsCompute;
+    }
+  }
+
   // Finally if everything else is the same, prefer large K size.
   return ShapedType::getNumElements(lhs.kSizes) >
          ShapedType::getNumElements(rhs.kSizes);
