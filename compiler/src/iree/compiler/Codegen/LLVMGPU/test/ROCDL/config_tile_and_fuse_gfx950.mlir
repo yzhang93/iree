@@ -316,3 +316,42 @@ func.func @matmul_f16_compute_bound(
 // CHECK-SAME:   #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse
 // CHECK:   lowering_config = #iree_gpu.lowering_config
 // CHECK-SAME: mma_kind = #iree_gpu.mma_layout<MFMA_F32_32x32x16_F16>
+
+// -----
+
+// Imbalanced bf16 matmul (M >> K) — the imbalancedGemm rule selects the 32x32
+// intrinsic for higher compute throughput, and the VGPR pressure cap reduces
+// the per-subgroup MN tile count from 16 to 8 so that per-thread output VGPRs
+// stay at 128 (instead of 256), enabling better occupancy.
+func.func @matmul_bf16_imbalanced_m(
+    %arg0: tensor<150016x1024xbf16>,
+    %arg1: tensor<1024x4096xbf16>,
+    %arg2: tensor<150016x4096xf32>) -> tensor<150016x4096xf32> {
+  %0 = linalg.matmul ins(%arg0, %arg1 : tensor<150016x1024xbf16>, tensor<1024x4096xbf16>)
+                      outs(%arg2 : tensor<150016x4096xf32>) -> tensor<150016x4096xf32>
+  return %0 : tensor<150016x4096xf32>
+}
+// CHECK-LABEL: func.func @matmul_bf16_imbalanced_m
+// CHECK-SAME:   #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse
+// CHECK:   lowering_config = #iree_gpu.lowering_config
+// CHECK-SAME: mma_kind = #iree_gpu.mma_layout<MFMA_F32_32x32x16_BF16>
+// CHECK-SAME: subgroup = [2, 4, 0]
+// CHECK-SAME: workgroup = [128, 256, 0]
+
+// -----
+
+// Imbalanced bf16 matmul (N >> K) — same VGPR cap applies symmetrically.
+func.func @matmul_bf16_imbalanced_n(
+    %arg0: tensor<4096x1024xbf16>,
+    %arg1: tensor<1024x150016xbf16>,
+    %arg2: tensor<4096x150016xf32>) -> tensor<4096x150016xf32> {
+  %0 = linalg.matmul ins(%arg0, %arg1 : tensor<4096x1024xbf16>, tensor<1024x150016xbf16>)
+                      outs(%arg2 : tensor<4096x150016xf32>) -> tensor<4096x150016xf32>
+  return %0 : tensor<4096x150016xf32>
+}
+// CHECK-LABEL: func.func @matmul_bf16_imbalanced_n
+// CHECK-SAME:   #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse
+// CHECK:   lowering_config = #iree_gpu.lowering_config
+// CHECK-SAME: mma_kind = #iree_gpu.mma_layout<MFMA_F32_32x32x16_BF16>
+// CHECK-SAME: subgroup = [2, 4, 0]
+// CHECK-SAME: workgroup = [128, 256, 0]

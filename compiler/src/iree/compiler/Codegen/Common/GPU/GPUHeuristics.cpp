@@ -775,6 +775,33 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
     localSeeds.bestMNTileCountPerSubgroup = adjustSeedsForWgpCount(
         problem, intrinsic, wgpCount, seeds.bestSubgroupCountPerWorkgroup,
         seeds.bestMNTileCountPerSubgroup, splitReductionTripCnt);
+
+    // For imbalanced shapes (M >> K or N >> K) using large intrinsics like
+    // 32x32, cap the per-subgroup MN tile count to limit output VGPR pressure.
+    // With 32x32 intrinsic and 16 MN tiles, each thread uses 256 f32 VGPRs
+    // for output alone (50% of 512), limiting occupancy to ~1 wave/SIMD.
+    // Capping at 128 output VGPRs per thread enables 2+ waves/SIMD, which
+    // improves latency hiding for these memory-intensive imbalanced shapes.
+    {
+      int64_t mSize = ShapedType::getNumElements(problem.mSizes);
+      int64_t nSize = ShapedType::getNumElements(problem.nSizes);
+      int64_t kSize = ShapedType::getNumElements(problem.kSizes);
+      bool isImbalanced = (mSize > 12 * kSize || nSize > 12 * kSize);
+      if (problem.gemmSize == GemmSize::LargeGemm && isImbalanced) {
+        constexpr int64_t kMaxOutputVGPRsPerThread = 128;
+        int64_t outputVGPRsPerTile =
+            (intrinsic.mSizes[0] * intrinsic.nSizes[0]) / subgroupSize;
+        if (outputVGPRsPerTile > 0) {
+          int64_t maxMNTiles = kMaxOutputVGPRsPerThread / outputVGPRsPerTile;
+          localSeeds.bestMNTileCountPerSubgroup = std::min(
+              localSeeds.bestMNTileCountPerSubgroup, maxMNTiles);
+          LDBG() << "Imbalanced shape: capping bestMNTileCountPerSubgroup to "
+                 << localSeeds.bestMNTileCountPerSubgroup
+                 << " (maxMNTiles=" << maxMNTiles << ")";
+        }
+      }
+    }
+
     GPUMMASchedule schedule =
         getOptimalMMASchedule(problem, intrinsic, localSeeds);
 
