@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include <cstdint>
+#include <functional>
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUInterfaces.h"
 #include "mlir/IR/Types.h"
 
@@ -146,18 +147,30 @@ struct GPUMMASchedule {
   }
 };
 
+/// Optional callback that selects heuristic seeds for a given (problem,
+/// intrinsic) pair. When provided to deduceMMASchedule, it is called once per
+/// intrinsic inside the intrinsic loop, replacing the caller-provided default
+/// seeds. This allows seed selection to be intrinsic-aware (e.g., a roofline
+/// model can compute optimal tile sizes knowing the exact intrinsic shape).
+/// Implementations live outside GPUHeuristics to avoid hardware-specific
+/// dependencies in this file.
+using SeedSelector = std::function<GPUMMAHeuristicSeeds(
+    const GPUMatmulShapeType &problem, const GPUIntrinsicType &intrinsic)>;
+
 /// Returns a schedule for using one of the given MMA |intrinsics| to target the
 /// input |problem|. Returns std::nullopt if we cannot find such a schedule.
 /// When |doCPromotion| is true, the accumulator uses shared memory. This can be
 /// due to padding requirements or because the operation has an existing
 /// accumulator that needs to be loaded from global memory (matmul_accumulate).
+/// When |seedSelector| is provided, it overrides |seeds| for each intrinsic.
 FailureOr<GPUMMASchedule> deduceMMASchedule(
     const GPUMatmulShapeType &problem, ArrayRef<GPUIntrinsicType> intrinsics,
     const GPUMMAHeuristicSeeds &seeds, int64_t sharedMemLimitInBytes,
     int64_t subgroupSize, std::optional<int64_t> cuCount, Location loc,
     bool transposedLhs = false, bool transposedRhs = false,
     bool canUpcastAcc = false, bool mustBeAligned = true,
-    bool doCPromotion = false, int64_t splitReductionTripCnt = 0);
+    bool doCPromotion = false, int64_t splitReductionTripCnt = 0,
+    std::optional<SeedSelector> seedSelector = std::nullopt);
 
 /// Returns a schedule for the pvMatmul in attention using one of the given MMA
 /// |intrinsics| to target the given attention matmul problems, |qkMatmul|

@@ -6,6 +6,9 @@
 
 #include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
 
+#include <cmath>
+#include <limits>
+
 #include "iree/compiler/Codegen/Common/GPU/GPUHeuristics.h"
 #include "iree/compiler/Codegen/Common/TileInferenceUtils.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
@@ -39,6 +42,13 @@ static llvm::cl::opt<bool> clGPUTestCpromotion(
     "iree-codegen-test-c-promotion",
     llvm::cl::desc("C promote in specific case of elemetwise operations that "
                    "codegen cant yet support without it if also doing padding"),
+    llvm::cl::init(true));
+
+static llvm::cl::opt<bool> clUseRooflineSeedSelection(
+    "iree-codegen-use-roofline-seeds",
+    llvm::cl::desc(
+        "Use roofline-based candidate evaluation for MMA heuristic seeds "
+        "instead of hardcoded lookup tables"),
     llvm::cl::init(true));
 
 namespace mlir::iree_compiler::IREE::GPU {
@@ -252,6 +262,408 @@ static GemmCutoff computeGemmCutoffsForAI(IREE::GPU::TargetAttr target,
   return {smallGemmCutoff, largeGemmCutoff};
 }
 
+//===----------------------------------------------------------------------===//
+// Roofline-Based Seed Selection (v2)
+//===----------------------------------------------------------------------===//
+
+/// Hardware parameters needed for roofline cost estimation, all extracted from
+/// TargetAttr. No manually tuned constants.
+struct RooflineHardwareInfo {
+  float peakFlopsPerSec;         // Peak compute in FLOP/s for this datatype.
+  float memBandwidthBytesPerSec; // Global memory bandwidth in bytes/s.
+  int64_t maxSharedMemoryBytes;  // Max shared memory per workgroup.
+  int64_t wgpCount;              // Number of workgroup processors (CUs/SMs).
+  int64_t subgroupSize;          // Preferred subgroup (warp/wave) size.
+  int64_t simdsPerWgp;           // Number of SIMD units per WGP.
+  int64_t vgprsPerSimd;          // Number of 32-bit VGPRs per SIMD unit.
+};
+
+/// Extract RooflineHardwareInfo from a TargetAttr. Returns std::nullopt if
+/// required fields are missing.
+static std::optional<RooflineHardwareInfo>
+extractRooflineHardwareInfo(IREE::GPU::TargetAttr target, Type computeType,
+                            bool scaled) {
+  if (!target || !target.getChip()) {
+    return std::nullopt;
+  }
+
+  TargetChipAttr chip = target.getChip();
+
+  // Extract peak TFLOPS for the compute datatype.
+  DictionaryAttr perfTflopsAttr = chip.getPerfTflops();
+  if (!perfTflopsAttr) {
+    return std::nullopt;
+  }
+
+  std::optional<ComputeBitwidths> computeBitwidth =
+      getComputeBitwidthForType(computeType);
+  if (!computeBitwidth) {
+    return std::nullopt;
+  }
+
+  float peakTflops = 0.0f;
+  for (NamedAttribute namedAttr : perfTflopsAttr) {
+    StringRef bitwidthStr = namedAttr.getName().strref();
+    auto floatAttr = dyn_cast<FloatAttr>(namedAttr.getValue());
+    if (!floatAttr) {
+      continue;
+    }
+    std::optional<ComputeBitwidths> bw = symbolizeComputeBitwidths(bitwidthStr);
+    if (bw && *bw == *computeBitwidth) {
+      peakTflops = floatAttr.getValue().convertToFloat();
+      break;
+    }
+  }
+  if (peakTflops == 0.0f) {
+    return std::nullopt;
+  }
+
+  // Extract memory bandwidth.
+  FloatAttr memBwAttr = chip.getMemoryBandwidthTbps();
+  if (!memBwAttr) {
+    return std::nullopt;
+  }
+  float memBandwidthTbps = memBwAttr.getValue().convertToFloat();
+  if (memBandwidthTbps == 0.0f) {
+    return std::nullopt;
+  }
+
+  // Convert units: TFLOPS -> FLOP/s, TB/s -> bytes/s.
+  float peakFlopsPerSec = peakTflops * 1e12f;
+  // The attribute is named "Tbps" but the stored values are in TB/s
+  // (terabytes per second).  E.g., MI355X stores 8.0 for 8 TB/s bandwidth.
+  // The existing `computeMemoryCutoff = TFLOPS / TB/s` correctly treats this
+  // as TB/s (TFLOPS / TB/s = FLOPS/byte).  We follow the same convention:
+  // TB/s * 1e12 = bytes/s.
+  float memBandwidthBytesPerSec = memBandwidthTbps * 1e12f;
+
+  auto wgp = target.getWgp();
+  int64_t maxSharedMemBytes = wgp.getMaxWorkgroupMemoryBytes();
+  int64_t wgpCount = chip.getWgpCount();
+  int64_t subgroupSize = target.getPreferredSubgroupSize();
+
+  // Extract SIMD topology from WGP attributes (required for occupancy model).
+  auto optSimdsPerWgp = wgp.getSimdsPerWgp();
+  auto optVgprSpaceBits = wgp.getVgprSpaceBits();
+  if (!optSimdsPerWgp || !optVgprSpaceBits) {
+    return std::nullopt;
+  }
+  int64_t simdsPerWgp = *optSimdsPerWgp;
+  // vgprSpaceBits is the VGPR bit-space per SIMD (numVGPRs * 32 bits each).
+  // Divide by 32 to get the number of 32-bit VGPRs per SIMD.
+  int64_t vgprsPerSimd = *optVgprSpaceBits / 32;
+
+  return RooflineHardwareInfo{peakFlopsPerSec,   memBandwidthBytesPerSec,
+                              maxSharedMemBytes, wgpCount,
+                              subgroupSize,      simdsPerWgp,
+                              vgprsPerSimd};
+}
+
+/// Evaluate a single seed candidate using a 7-step occupancy-aware roofline
+/// model. Returns a predicted cost (lower is better). Returns infinity if the
+/// candidate is infeasible (exceeds shared memory or register limits).
+///
+/// The 8 steps are:
+///   1. Tile dimensions (from seeds + intrinsic shape)
+///   2. Feasibility filters (LDS + VGPRs) and occupancy
+///   3. Workgroup count, K-iterations & hardware utilization (workUtil)
+///   4. Per-WG roofline cost (with L2 cache reuse + N-clipping for conv)
+///   5. Total cost with AI-weighted occupancy, divided by workUtil
+///   6. Multi-wave penalty (sqrt-scaled, both GEMM and conv)
+///   7. Tie-break biases
+///
+/// Heuristic constants (only 2):
+///   - memBoundFrac exponent = 2 (compresses compute/memory transition)
+///   - ILP bias magnitude = 1e-2 (overcomes occupancy advantage for
+///     compute-bound shapes)
+///
+/// All other parameters are derived from hardware or problem shape.
+static double evaluateSeedCandidate(
+    int64_t subgroupCount, int64_t mnTileCount, int64_t kTileCount,
+    int64_t mSize, int64_t nSize, int64_t kSize, int64_t bytesPerElem,
+    const RooflineHardwareInfo &hw, int64_t intrinsicM, int64_t intrinsicN,
+    int64_t intrinsicK, int64_t splitReductionTripCnt = 0,
+    bool isGemm = true) {
+
+  // ── Step 1: Tile dimensions ───────────────────────────────────────────
+  int64_t sgSqrt = 1ull << llvm::divideCeil(llvm::Log2_64(subgroupCount), 2);
+  int64_t tileSqrt = 1ull << (llvm::Log2_64(mnTileCount) / 2);
+
+  int64_t wgTileM = sgSqrt * tileSqrt * intrinsicM;
+  int64_t wgTileN =
+      (subgroupCount / sgSqrt) * (mnTileCount / tileSqrt) * intrinsicN;
+  int64_t wgTileK = kTileCount * intrinsicK;
+
+  if (wgTileM <= 0 || wgTileN <= 0 || wgTileK <= 0) {
+    return std::numeric_limits<double>::max();
+  }
+
+  // ── Step 2: Feasibility filters + occupancy ───────────────────────────
+
+  // 2a. LDS constraint (hard filter).
+  int64_t sharedMemUsed =
+      (wgTileM * wgTileK + wgTileN * wgTileK) * bytesPerElem;
+  if (sharedMemUsed > hw.maxSharedMemoryBytes) {
+    return std::numeric_limits<double>::max();
+  }
+
+  // 2b. VGPR feasibility (hard filter).
+  //
+  // Estimate VGPRs: accumulator + operand (A/B) registers.
+  // When subgroupCount > simdsPerWgp, multiple waves share a SIMD's register
+  // file.  If total demand exceeds hardware capacity → register spilling.
+  int64_t accVGPRs = mnTileCount * intrinsicM * intrinsicN / hw.subgroupSize;
+  int64_t sqrtMN =
+      std::max(1L, (int64_t)std::ceil(std::sqrt((double)mnTileCount)));
+  int64_t aVGPRsPerMMA = llvm::divideCeil(
+      intrinsicM * intrinsicK * bytesPerElem, hw.subgroupSize * 4);
+  int64_t bVGPRsPerMMA = llvm::divideCeil(
+      intrinsicK * intrinsicN * bytesPerElem, hw.subgroupSize * 4);
+  int64_t operandVGPRs = sqrtMN * (aVGPRsPerMMA + bVGPRsPerMMA);
+  int64_t totalVGPRs = accVGPRs + operandVGPRs;
+
+  int64_t wavesPerSimdPerWG = llvm::divideCeil(subgroupCount, hw.simdsPerWgp);
+  if (totalVGPRs * wavesPerSimdPerWG > hw.vgprsPerSimd) {
+    return std::numeric_limits<double>::max();
+  }
+
+  // 2c. Register-based occupancy (used in Step 5).
+  int64_t maxWavesPerSimd = hw.vgprsPerSimd / std::max(totalVGPRs, 1L);
+  int64_t regOcc = maxWavesPerSimd / std::max(wavesPerSimdPerWG, 1L);
+  regOcc = std::max(regOcc, 1L);
+
+  // ── Step 3: Workgroup count, K-iterations & hardware utilization ────────
+  int64_t splitK = splitReductionTripCnt > 1 ? splitReductionTripCnt : 1;
+  int64_t numWGs_M = llvm::divideCeil(mSize, wgTileM);
+  int64_t numWGs_N = llvm::divideCeil(nSize, wgTileN);
+  int64_t numWGs = numWGs_M * numWGs_N * splitK;
+
+  double effectiveK = (double)llvm::divideCeil(kSize, splitK);
+  // Fractional kIters: floating-point division avoids integer ceiling
+  // artifacts that create artificial kTile preferences.
+  double kIters = effectiveK / (double)wgTileK;
+
+  // Hardware utilization: ratio of useful work to total dispatched work.
+  // When a tile is much larger than the problem dimension (e.g., wgTileM=128
+  // but M=20), most of each workgroup's compute is wasted on out-of-bounds
+  // elements. workUtil ∈ (0, 1]; lower values penalize under-utilized tile
+  // grids. This is critical for medium-CI shapes where one dimension is
+  // small (47% of RDNA4 tuned medium convolutions use mnTiles=1).
+  double paddedM = (double)(numWGs_M * wgTileM);
+  double paddedN = (double)(numWGs_N * wgTileN);
+  double workUtil =
+      ((double)mSize * (double)nSize) / (paddedM * paddedN + 1e-10);
+
+  // ── Step 4: Per-WG roofline cost (with L2 cache reuse) ─────────────────
+  //
+  // For conv: clip effective N-tile to min(wgTileN, nSize).  Grouped
+  // convolutions have small N (channels-per-group), so different subgroup
+  // counts produce different wgTileN but the same effective N-work per WG.
+  double effTileN = isGemm ? (double)wgTileN
+                           : std::min((double)wgTileN, (double)nSize);
+
+  // Memory traffic model:
+  //
+  // GEMM: L2 cache reuse — A tiles are reused across N-columns of WGs,
+  // B tiles across M-rows. Cap at 8 to avoid over-estimating reuse on
+  // GPUs with small L2 caches (e.g., RDNA4 ~64MB).
+  //
+  // Conv: simple (M+N)*K model — no L2 reuse. Conv's strided/dilated
+  // memory access patterns (input halos, filter windows) don't follow
+  // GEMM's tidy A-row/B-column reuse pattern. Assuming L2 reuse for conv
+  // gives tiny tiles (32x32) an artificial 4-8× memory cost advantage,
+  // pushing the model toward sg=2 mn=2 kt=8 configs that have terrible
+  // codegen efficiency (register spilling, poor scheduling).
+  double bytesLoaded;
+  if (isGemm) {
+    static constexpr double kMaxCacheReuse = 8.0;
+    double aTileBytes = (double)wgTileM * (double)wgTileK * bytesPerElem;
+    double bTileBytes = effTileN * (double)wgTileK * bytesPerElem;
+    double aReuse = std::min((double)numWGs_N, kMaxCacheReuse);
+    double bReuse = std::min((double)numWGs_M, kMaxCacheReuse);
+    bytesLoaded = aTileBytes / aReuse + bTileBytes / bReuse;
+  } else {
+    bytesLoaded =
+        ((double)wgTileM + effTileN) * (double)wgTileK * bytesPerElem;
+  }
+
+  double flopsVal = 2.0 * (double)wgTileM * effTileN * (double)wgTileK;
+
+  // Each WGP gets 1/wgpCount of the total bandwidth and compute.
+  double memTime = bytesLoaded / (hw.memBandwidthBytesPerSec / hw.wgpCount);
+  double compTime = flopsVal / (hw.peakFlopsPerSec / hw.wgpCount);
+  double iterCost = std::max(memTime, compTime);
+
+  // ── Step 5: Total cost with AI-weighted occupancy ─────────────────────
+  //
+  // Global arithmetic intensity determines whether occupancy can help.
+  // When the problem is globally compute-bound (globalAI >> ridge), the ALU
+  // is the bottleneck and higher occupancy can't increase throughput.
+  // Bytes include A (M*K), B (K*N), and C (M*N) — matching the existing
+  // computeIntensity formula: flops / (M*N + N*K + M*K).
+  double globalBytes =
+      ((double)mSize * (double)nSize + (double)nSize * (double)kSize +
+       (double)mSize * (double)kSize) *
+      (double)bytesPerElem;
+  double globalFlops = 2.0 * (double)mSize * (double)nSize * (double)kSize;
+  double globalAI = globalFlops / (globalBytes + 1e-10);
+  double ridgePoint =
+      (double)hw.peakFlopsPerSec / ((double)hw.memBandwidthBytesPerSec + 1e-10);
+  double memBoundFracRaw = std::min(1.0, ridgePoint / (globalAI + 1e-10));
+  // Squaring compresses the transition region:
+  //   raw=0.1 → 0.01  (compute-bound: occupancy negligible)
+  //   raw=0.5 → 0.25  (moderate)
+  //   raw=1.0 → 1.0   (memory-bound: full occupancy benefit)
+  double memBoundFrac = memBoundFracRaw * memBoundFracRaw;
+
+  // Effective occupancy with sublinear (sqrt) scaling for diminishing returns.
+  // Unified model for both GEMM and conv: rawEffOcc = sqrt(regOcc).
+  // The old conv-specific model (sqrt(regOcc * wavesPerSimdPerWG)) inflated
+  // the advantage of high subgroup counts, pushing toward sg=8 — opposite
+  // of what RDNA4 tuning data shows (conv prefers sg=4, 34% mode).
+  double rawEffOcc = std::sqrt((double)regOcc);
+  // Weight occupancy benefit by global memory-boundedness.
+  double effOcc = 1.0 + (rawEffOcc - 1.0) * memBoundFrac;
+
+  double concurrentWGs = (double)hw.wgpCount * effOcc;
+  double numTimesteps = (double)numWGs / concurrentWGs;
+  // Divide by workUtil to penalize low hardware utilization. A config that
+  // uses only 50% of dispatched compute (workUtil=0.5) costs 2x more than
+  // one with full utilization (workUtil=1.0). This drives the model toward
+  // smaller tiles when M or N is much smaller than the tile size.
+  double totalCost = iterCost * kIters * numTimesteps / workUtil;
+
+  // ── Step 6: Multi-wave penalty ────────────────────────────────────────
+  //
+  // When sg > simdsPerWgp, multiple waves share each SIMD, competing for
+  // ALU and issue slots.
+  //
+  // GEMM: sqrt penalty. On RDNA4 (simdsPerWgp=4), sg=8 gives
+  // wavesPerSimdPerWG=2, sqrt(2)≈1.41 penalty. Tuning shows sg=8 is
+  // optimal for 44% of large GEMMs — the occupancy benefit outweighs
+  // the 41% contention cost. On CDNA3 (sg=4, wavesPerSimd=1), no penalty.
+  //
+  // Conv: no penalty. The original CDNA3 conv seeds intentionally use
+  // sg=8 with the comment "Favor more subgroups for convolution to help
+  // latency hiding from global loads." Conv's irregular memory access
+  // patterns (strided, dilated) benefit more from wave-level latency
+  // hiding than GEMMs. Without a penalty, the cost model decides solely
+  // based on the roofline cost — on RDNA4, the LDS constraint and
+  // occupancy model naturally limit conv to sg=4; on CDNA3 with more
+  // VGPRs and different memory latency characteristics, sg=8 remains
+  // viable.
+  if (isGemm && wavesPerSimdPerWG > 1) {
+    totalCost *= std::sqrt((double)wavesPerSimdPerWG);
+  }
+
+  // ── Step 7: Tie-break biases ──────────────────────────────────────────
+
+  // 7a. Subgroup count preference.
+  // GEMM: prefer sg closest to simdsPerWgp (1 wave/SIMD = max ILP).
+  // Conv: no sg preference — let the cost model decide. On RDNA4 (smaller
+  // VGPRs, 64KB LDS), the VGPR and LDS constraints naturally push toward
+  // sg=4. On CDNA3 (512 VGPRs, 64KB LDS), sg=8 may survive the filters
+  // and win on cost due to better latency hiding.
+  if (isGemm) {
+    double sgDist =
+        std::abs((double)subgroupCount - (double)hw.simdsPerWgp);
+    totalCost *= (1.0 + 1e-6 * sgDist);
+  }
+
+  // 7b. Tile-size + ILP bias (adaptive, the 2nd heuristic constant).
+  // Compute-bound (memBoundFrac→0): up to ~1% per mn unit — strong enough
+  // to overcome the small occupancy benefit from effOcc.
+  // Memory-bound (memBoundFrac→1): ~0%, so occupancy scaling dominates.
+  double tileSizeBias = 1e-7 + (1.0 - memBoundFrac) * 1e-2;
+  totalCost *= (1.0 - tileSizeBias * (double)mnTileCount);
+
+  // 7c. Prefer larger kTile (fewer K-loop iterations, less loop overhead).
+  totalCost *= (1.0 - 1e-8 * (double)kTileCount);
+
+  return totalCost;
+}
+
+/// Enumerate seed candidates and select the one with the lowest roofline cost
+/// for a specific intrinsic.
+///
+/// Search space: sg in {2,4,8}, mn in {2,4,8,16}, kt in {2,4,8}.
+/// Conv caps kt at 4 to prevent codegen-unfriendly large wgTileK.
+/// The cost model's LDS and VGPR filters prune infeasible configs.
+static GPUMMAHeuristicSeeds
+selectBestSeeds(int64_t mSize, int64_t nSize, int64_t kSize, int64_t inBitWidth,
+                const RooflineHardwareInfo &hw, int64_t intrinsicM,
+                int64_t intrinsicN, int64_t intrinsicK,
+                int64_t splitReductionTripCnt = 0,
+                GemmSize gemmSize = GemmSize::LargeGemm,
+                bool isGemm = true) {
+  static constexpr int64_t kSubgroupCounts[] = {2, 4, 8};
+  static constexpr int64_t kMNTileCounts[] = {2, 4, 8, 16};
+  // kTiles starting at 2: kTiles=1 is rarely optimal (only 16% of RDNA4
+  // tuned configs) and the LDS constraint naturally handles edge cases.
+  static constexpr int64_t kKTileCounts[] = {2, 4, 8};
+
+  int64_t bytesPerElem = inBitWidth / 8;
+  if (bytesPerElem == 0) {
+    bytesPerElem = 1;
+  }
+
+  // Conv kTile cap: without L2 cache reuse, the cost model correctly
+  // penalizes large wgTileK. But kt=8 (wgTileK=128 for bf16) still passes
+  // LDS/VGPR filters and can look marginally cheaper due to fewer K-iters,
+  // yet causes register spilling and poor scheduling in conv codegen.
+  // Cap at 4 (wgTileK=64): prevents kt=8 catastrophes (5x slowdowns on
+  // c=2048 conv shapes) while allowing kt=4 which is optimal for 44% of
+  // RDNA4 tuned GEMM shapes.
+  //
+  // GEMM: no cap — L2 cache reuse correctly models the memory cost, and
+  // kt=8 works well for GEMM codegen.
+  int64_t maxKTileCount = isGemm ? 8 : 4;
+
+  double bestCost = std::numeric_limits<double>::max();
+  int64_t bestSubgroupCount = 4;
+  int64_t bestMNTileCount = 8;
+  int64_t bestKTileCount = 2;
+
+  // Uniform search over all (sg, mn, kTile) combinations.
+  for (int64_t sg : kSubgroupCounts) {
+    for (int64_t mn : kMNTileCounts) {
+      for (int64_t kt : kKTileCounts) {
+        if (kt > maxKTileCount)
+          continue;
+        double cost = evaluateSeedCandidate(
+            sg, mn, kt, mSize, nSize, kSize, bytesPerElem, hw, intrinsicM,
+            intrinsicN, intrinsicK, splitReductionTripCnt, isGemm);
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestSubgroupCount = sg;
+          bestMNTileCount = mn;
+          bestKTileCount = kt;
+        }
+      }
+    }
+  }
+
+  // Derive bestKElementCountPerSubgroup from kTileCount and intrinsic K.
+  int64_t bestKElementCount = bestKTileCount * intrinsicK;
+
+  LLVM_DEBUG({
+    llvm::dbgs() << "[RooflineSeeds] Selected seeds for intrinsic "
+                 << intrinsicM << "x" << intrinsicN << "x" << intrinsicK
+                 << ": subgroupCount=" << bestSubgroupCount
+                 << ", mnTileCount=" << bestMNTileCount
+                 << ", kTileCount=" << bestKTileCount
+                 << ", kElementCount=" << bestKElementCount
+                 << " (cost=" << bestCost << ")\n";
+  });
+
+  return GPUMMAHeuristicSeeds{bestSubgroupCount, bestMNTileCount,
+                              bestKTileCount, bestKElementCount};
+}
+
+//===----------------------------------------------------------------------===//
+// Hardcoded Seed Lookup Tables (fallback)
+//===----------------------------------------------------------------------===//
+
 static std::optional<GPUMMAHeuristicSeeds>
 getGemmHeuristicSeeds(GemmSize gemmSize, int64_t inBitWidth, bool scaled) {
   switch (gemmSize) {
@@ -437,11 +849,43 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
     wgpCount = chip.getWgpCount();
   }
 
+  // Build a roofline-based seed selector callback if enabled and hardware info
+  // is available. When provided, deduceMMASchedule will call this for each
+  // intrinsic it tries, so seeds are computed with the exact intrinsic shape.
+  std::optional<SeedSelector> seedSelector = std::nullopt;
+  if (clUseRooflineSeedSelection) {
+    std::optional<RooflineHardwareInfo> hwInfo =
+        extractRooflineHardwareInfo(target, problem.aType, scaled);
+    if (hwInfo) {
+      int64_t inBitWidth = problem.aType.getIntOrFloatBitWidth();
+      seedSelector =
+          [hwInfo = *hwInfo, mSize, nSize, kSize, inBitWidth,
+           splitReductionTripCnt, gemmSize = problem.gemmSize,
+           isGemm](const GPUMatmulShapeType & /*problem*/,
+                   const GPUIntrinsicType &intrinsic) {
+            LDBG() << "Roofline seed selection for intrinsic "
+                   << intrinsic.mSizes[0] << "x" << intrinsic.nSizes[0] << "x"
+                   << intrinsic.kSizes[0]
+                   << (isGemm ? " (GEMM)" : " (conv)");
+            return selectBestSeeds(mSize, nSize, kSize, inBitWidth, hwInfo,
+                                   intrinsic.mSizes[0], intrinsic.nSizes[0],
+                                   intrinsic.kSizes[0], splitReductionTripCnt,
+                                   gemmSize, isGemm);
+          };
+    } else {
+      LDBG() << "Roofline seed selection enabled but hardware info "
+                "unavailable (target has no chip attributes). "
+                "Falling back to default hardcoded seeds.";
+      // seedSelector stays nullopt → deduceMMASchedule uses default seeds.
+    }
+  }
+
   // First try to find a schedule with an exactly matching intrinsic.
   std::optional<GPUMMASchedule> schedule = deduceMMASchedule(
       problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize,
       wgpCount, loc, transposedLhs, transposedRhs, /*canUpcastAcc=*/false,
-      /*mustBeAligned=*/mustBeAligned, doCPromotion, splitReductionTripCnt);
+      /*mustBeAligned=*/mustBeAligned, doCPromotion, splitReductionTripCnt,
+      seedSelector);
   return schedule;
 }
 
