@@ -43,6 +43,24 @@ func.func @no_transform_column_hint_unused() -> vector<4x1xf16> {
 
 // -----
 
+// Test: Column index is a block argument (e.g. scf.for induction variable) - no transformation.
+// CHECK-LABEL: func.func @no_transform_column_from_block_arg
+// CHECK-NOT: amdgpu.transpose_load
+// CHECK: vector.transfer_read
+func.func @no_transform_column_from_block_arg(%col_arg: index) -> vector<4x1xf16> {
+  %src = memref.alloc() : memref<128x256xf16, #gpu.address_space<workgroup>>
+  %c0 = arith.constant 0 : index
+  %row = iree_codegen.index_hint %c0(#iree_gpu.lane_constant<16>) : index
+  %cst = arith.constant 0.0 : f16
+  // Column index is a block argument with no defining op
+  %0 = vector.transfer_read %src[%row, %col_arg], %cst
+       {in_bounds = [true, true], permutation_map = affine_map<(d0, d1) -> (d0, d1)>}
+       : memref<128x256xf16, #gpu.address_space<workgroup>>, vector<4x1xf16>
+  return %0 : vector<4x1xf16>
+}
+
+// -----
+
 // Test: Innermost vector dimension != 1 - no transformation
 // CHECK-LABEL: func.func @no_transform_column_size_not_1
 // CHECK-NOT: amdgpu.transpose_load
