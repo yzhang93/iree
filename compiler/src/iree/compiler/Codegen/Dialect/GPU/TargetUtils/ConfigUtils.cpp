@@ -830,9 +830,34 @@ getMatmulOrIGEMMLoweringConfigAndWorkgroupSize(
   SmallVector<int64_t> workgroupTileSizes(bounds.size(), 0);
   SmallVector<int64_t> reductionTileSizes(bounds.size(), 0);
   SmallVector<int64_t> subgroupTileSizes(bounds.size(), 0);
-  // Tile all batch dimensions with unit size.
-  for (int64_t batch : contractionB) {
-    workgroupTileSizes[batch] = 1;
+  // Tile batch dimensions. Normally each workgroup handles a single batch
+  // element (tile size 1). However, when the MMA schedule's M*N tile is small
+  // — indicated by the inner M or N dimension being smaller than the intrinsic
+  // tile (requiring padding) — each workgroup has little useful compute. In
+  // that case, increase the batch tile so each workgroup processes multiple
+  // batch elements, amortizing dispatch and memory access overhead. This is
+  // common in grouped convolutions with small per-group channel counts.
+  {
+    int64_t intrinsicM = schedule->getTotalMSize();
+    int64_t intrinsicN = schedule->getTotalNSize();
+    bool needsMNPadding = problem.mSizes.back() < intrinsicM &&
+                          problem.nSizes.back() < intrinsicN;
+    for (int64_t batch : contractionB) {
+      if (!needsMNPadding || ShapedType::isDynamic(bounds[batch])) {
+        workgroupTileSizes[batch] = 1;
+        continue;
+      }
+      // Find the largest power-of-2 tile (up to 4) that divides the batch.
+      int64_t batchSize = bounds[batch];
+      int64_t batchTile = 1;
+      for (int64_t t = 4; t >= 2; t /= 2) {
+        if (batchSize % t == 0) {
+          batchTile = t;
+          break;
+        }
+      }
+      workgroupTileSizes[batch] = batchTile;
+    }
   }
 
   // Tile all m, n, k and k_b dimensions to 1 except the innermost. Unit dims
