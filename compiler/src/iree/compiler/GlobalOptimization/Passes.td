@@ -28,6 +28,11 @@ def ConvertStridedContractionToContractionPass:
   let summary = "Factors out an extract_slice from contraction-like ops with strided inputs.";
 }
 
+def ConvertStridedInsertSliceToGenericPass:
+    Pass<"iree-global-opt-convert-strided-insert-slice-to-generic", ""> {
+  let summary = "Converts strided insert_slice into zero-constant destinations to linalg.generic with index arithmetic.";
+}
+
 def DecomposeConcatPass :
     Pass<"iree-global-opt-decompose-concat", ""> {
   let summary = "Decomposes concatenations into a destination and a sequence of slice inserts.";
