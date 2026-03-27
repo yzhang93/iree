@@ -151,6 +151,11 @@ def LinalgQuantizedMatmulToMatmulPass
   let summary = "lower quantized_matmul to matmul";
 }
 
+def SwapStridedScatterWithContractionPass:
+    Pass<"iree-global-opt-swap-strided-scatter-with-contraction", ""> {
+  let summary = "Swap strided scatter (insert_slice into zeros) with consumer contraction for 1x1 backward convolutions.";
+}
+
 def RaiseSpecialOpsPass :
     Pass<"iree-global-opt-raise-special-ops", ""> {
   let summary = "Raises special ops like softmax to the high level linalg.ext representation.";
