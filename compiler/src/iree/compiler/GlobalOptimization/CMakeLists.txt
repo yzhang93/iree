@@ -63,6 +63,7 @@ iree_cc_library(
     "RaiseSpecialOps.cpp"
     "RemoveZeroExtentTensors.cpp"
     "SimplifyPackUnpack.cpp"
+    "SwapStridedScatterWithContraction.cpp"
     "Utils.cpp"
     "WarnOnUninitializedValues.cpp"
   DEPS
