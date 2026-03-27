@@ -4,20 +4,20 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/GlobalOptimization/Passes.h"
+#include "iree/compiler/Preprocessing/Common/Passes.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/WalkPatternRewriteDriver.h"
 
-namespace mlir::iree_compiler::GlobalOptimization {
+namespace mlir::iree_compiler::Preprocessing {
 
 #define GEN_PASS_DEF_CONVERTSTRIDEDINSERTSLICETOGENERICPASS
-#include "iree/compiler/GlobalOptimization/Passes.h.inc"
+#include "iree/compiler/Preprocessing/Common/Passes.h.inc"
 
 namespace {
 
@@ -32,8 +32,11 @@ namespace {
 ///
 /// For each output position, the generic checks whether the position maps
 /// to a valid source element (i.e., (pos - offset) is non-negative,
-/// divisible by stride, and the quotient is in-bounds). If so, it extracts
-/// from the source; otherwise it yields zero.
+/// divisible by stride, and the quotient is in-bounds). Source indices are
+/// clamped to valid range so the extract is always safe, and arith.select
+/// chooses between the extracted value and zero. This avoids scf.if
+/// branches that prevent vectorization and cause GPU branch divergence.
+/// Power-of-2 strides use bitwise ops instead of expensive integer division.
 class ConvertStridedInsertSliceToGeneric
     : public OpRewritePattern<tensor::InsertSliceOp> {
 public:
@@ -98,7 +101,6 @@ public:
           for (unsigned i = 0; i < rank; i++) {
             Value idx = linalg::IndexOp::create(b, loc, i);
 
-            // Skip trivial dims where stride=1 and offset=0.
             if (strides[i] == 1 && offsets[i] == 0) {
               srcIndices.push_back(idx);
               continue;
@@ -106,15 +108,26 @@ public:
 
             Value off =
                 arith::ConstantOp::create(b, loc, b.getIndexAttr(offsets[i]));
-            Value str =
-                arith::ConstantOp::create(b, loc, b.getIndexAttr(strides[i]));
             Value srcSize = arith::ConstantOp::create(
                 b, loc, b.getIndexAttr(srcTy.getDimSize(i)));
 
             Value shifted = arith::SubIOp::create(b, loc, idx, off);
-            Value rem = arith::RemSIOp::create(b, loc, shifted, str);
-            Value srcIdx = arith::DivSIOp::create(b, loc, shifted, str);
-            srcIndices.push_back(srcIdx);
+
+            Value rem, srcIdx;
+            bool isPow2 = (strides[i] & (strides[i] - 1)) == 0;
+            if (isPow2) {
+              Value strideMask = arith::ConstantOp::create(
+                  b, loc, b.getIndexAttr(strides[i] - 1));
+              Value log2Stride = arith::ConstantOp::create(
+                  b, loc, b.getIndexAttr(llvm::Log2_64(strides[i])));
+              rem = arith::AndIOp::create(b, loc, shifted, strideMask);
+              srcIdx = arith::ShRSIOp::create(b, loc, shifted, log2Stride);
+            } else {
+              Value str =
+                  arith::ConstantOp::create(b, loc, b.getIndexAttr(strides[i]));
+              rem = arith::RemSIOp::create(b, loc, shifted, str);
+              srcIdx = arith::DivSIOp::create(b, loc, shifted, str);
+            }
 
             Value geZero = arith::CmpIOp::create(
                 b, loc, arith::CmpIPredicate::sge, shifted, zero);
@@ -128,6 +141,15 @@ public:
             allValid = allValid
                            ? arith::AndIOp::create(b, loc, allValid, dimValid)
                            : dimValid;
+
+            // Clamp to [0, srcSize-1] so the extract is always in-bounds,
+            // even when the predicate is false.
+            Value srcSizeM1 = arith::SubIOp::create(
+                b, loc, srcSize,
+                arith::ConstantOp::create(b, loc, b.getIndexAttr(1)));
+            Value clamped = arith::MaxSIOp::create(b, loc, srcIdx, zero);
+            clamped = arith::MinSIOp::create(b, loc, clamped, srcSizeM1);
+            srcIndices.push_back(clamped);
           }
 
           Value zeroElem;
@@ -139,24 +161,19 @@ public:
                 arith::ConstantOp::create(b, loc, b.getIntegerAttr(elemTy, 0));
           }
 
+          // Always extract (indices are clamped to valid range).
+          Value extracted = tensor::ExtractOp::create(b, loc, src, srcIndices);
+
           if (!allValid) {
-            Value extracted =
-                tensor::ExtractOp::create(b, loc, src, srcIndices);
+            // No strided dims had predicates; just yield the extracted value.
             linalg::YieldOp::create(b, loc, extracted);
             return;
           }
 
-          auto ifOp = scf::IfOp::create(
-              b, loc, allValid,
-              [&](OpBuilder &tb, Location tl) {
-                Value extracted =
-                    tensor::ExtractOp::create(tb, tl, src, srcIndices);
-                scf::YieldOp::create(tb, tl, extracted);
-              },
-              [&](OpBuilder &eb, Location el) {
-                scf::YieldOp::create(eb, el, zeroElem);
-              });
-          linalg::YieldOp::create(b, loc, ifOp.getResult(0));
+          // Select between extracted value and zero based on predicate.
+          Value result =
+              arith::SelectOp::create(b, loc, allValid, extracted, zeroElem);
+          linalg::YieldOp::create(b, loc, result);
         });
 
     rewriter.replaceOp(op, genericOp.getResult(0));
@@ -169,7 +186,7 @@ struct ConvertStridedInsertSliceToGenericPass
           ConvertStridedInsertSliceToGenericPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, linalg::LinalgDialect,
-                    tensor::TensorDialect, scf::SCFDialect>();
+                    tensor::TensorDialect>();
   }
 
   void runOnOperation() override {
@@ -181,4 +198,4 @@ struct ConvertStridedInsertSliceToGenericPass
 };
 
 } // namespace
-} // namespace mlir::iree_compiler::GlobalOptimization
+} // namespace mlir::iree_compiler::Preprocessing

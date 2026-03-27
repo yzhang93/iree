@@ -197,10 +197,6 @@ void buildGlobalOptimizationPassPipeline(
       .addPass(IREE::Flow::createCanonicalizePass)
       .addPass(mlir::createCSEPass);
   mainPassManager.addPass(
-      GlobalOptimization::createSwapStridedScatterWithContractionPass());
-  mainPassManager.addPass(
-      GlobalOptimization::createConvertStridedInsertSliceToGenericPass());
-  mainPassManager.addPass(
       GlobalOptimization::createConvertStridedContractionToContractionPass());
 
   // Enable data tiling after they are in a canonical form.

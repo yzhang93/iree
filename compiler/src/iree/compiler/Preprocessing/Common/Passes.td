@@ -78,6 +78,16 @@ def ConvertConvToChannelsLastPass :
   ];
 }
 
+def ConvertStridedInsertSliceToGenericPass:
+    Pass<"iree-preprocessing-convert-strided-insert-slice-to-generic", ""> {
+  let summary = "Converts strided insert_slice into zero-constant destinations to linalg.generic with index arithmetic.";
+}
+
+def SwapStridedScatterWithContractionPass:
+    Pass<"iree-preprocessing-swap-strided-scatter-with-contraction", ""> {
+  let summary = "Swap strided scatter (insert_slice into zeros) with consumer contraction for 1x1 backward convolutions.";
+}
+
 def FoldAttentionWithTransposePass :
     Pass<"iree-preprocessing-fold-attention-with-transpose", ""> {
   let summary = "Fold attention operation with transpose";

@@ -16,7 +16,6 @@ iree_lit_test_suite(
   SRCS
     "cleanup_numeric_narrowing.mlir"
     "conv2d_to_img2col.mlir"
-    "convert_strided_insert_slice_to_generic.mlir"
     "data_layout_propagation.mlir"
     "demote_contraction_inputs.mlir"
     "detach_elementwise_from_named_ops.mlir"

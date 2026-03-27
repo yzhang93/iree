@@ -43,7 +43,6 @@ iree_cc_library(
     "CleanupNumericNarrowing.cpp"
     "ConvertConv2DToImg2Col.cpp"
     "ConvertStridedContractionToContraction.cpp"
-    "ConvertStridedInsertSliceToGeneric.cpp"
     "DataLayoutPropagation.cpp"
     "DecomposeConcat.cpp"
     "DemoteContractionInputs.cpp"
@@ -63,7 +62,6 @@ iree_cc_library(
     "RaiseSpecialOps.cpp"
     "RemoveZeroExtentTensors.cpp"
     "SimplifyPackUnpack.cpp"
-    "SwapStridedScatterWithContraction.cpp"
     "Utils.cpp"
     "WarnOnUninitializedValues.cpp"
   DEPS

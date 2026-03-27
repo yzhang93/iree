@@ -31,6 +31,7 @@ iree_cc_library(
     "Convert1X1FilterConv2DToMatmul.cpp"
     "ConvertConvFilterToChannelsLast.cpp"
     "ConvertConvToChannelsLast.cpp"
+    "ConvertStridedInsertSliceToGeneric.cpp"
     "FoldAttentionWithTranspose.cpp"
     "GeneralizeLinalgMatMul.cpp"
     "Interpreter.cpp"
@@ -38,6 +39,7 @@ iree_cc_library(
     "PadLinalgOps.cpp"
     "PadToIntrinsics.cpp"
     "Passes.cpp"
+    "SwapStridedScatterWithContraction.cpp"
     "TransposeMatmul.cpp"
   DEPS
     ::PassesIncGen

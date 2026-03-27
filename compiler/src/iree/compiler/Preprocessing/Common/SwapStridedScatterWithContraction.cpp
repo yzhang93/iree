@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include "iree/compiler/GlobalOptimization/Passes.h"
+#include "iree/compiler/Preprocessing/Common/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -13,10 +13,10 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/WalkPatternRewriteDriver.h"
 
-namespace mlir::iree_compiler::GlobalOptimization {
+namespace mlir::iree_compiler::Preprocessing {
 
 #define GEN_PASS_DEF_SWAPSTRIDEDSCATTERWITHCONTRACTIONPASS
-#include "iree/compiler/GlobalOptimization/Passes.h.inc"
+#include "iree/compiler/Preprocessing/Common/Passes.h.inc"
 
 namespace {
 
@@ -73,18 +73,23 @@ public:
       return failure();
     }
 
-    // Skip bf16 for now.
-    auto insertResultTy =
-        cast<RankedTensorType>(insertOp.getResult().getType());
-    if (!insertResultTy.getElementType().isF16()) {
-      return failure();
-    }
-
-    // The insert_slice result must have exactly one user: a contraction.
+    // The insert_slice result must feed into a contraction, possibly through
+    // a compute_barrier.
     if (!insertOp->hasOneUse()) {
       return failure();
     }
-    auto convOp = dyn_cast<linalg::GenericOp>(*insertOp->user_begin());
+    Value scatterResult = insertOp.getResult();
+    Operation *user = *insertOp->user_begin();
+    // Look through compute_barrier.start if present.
+    if (user->getName().getStringRef() ==
+        "iree_tensor_ext.compute_barrier.start") {
+      if (!user->hasOneUse()) {
+        return failure();
+      }
+      scatterResult = user->getResult(0);
+      user = *user->user_begin();
+    }
+    auto convOp = dyn_cast<linalg::GenericOp>(user);
     if (!convOp) {
       return failure();
     }
@@ -99,20 +104,55 @@ public:
 
     // Check which operand is the scattered tensor.
     int scatterOperandIdx = -1;
-    if (convOp.getDpsInputOperand(0)->get() == insertOp.getResult()) {
+    if (convOp.getDpsInputOperand(0)->get() == scatterResult) {
       scatterOperandIdx = 0;
-    } else if (convOp.getDpsInputOperand(1)->get() == insertOp.getResult()) {
+    } else if (convOp.getDpsInputOperand(1)->get() == scatterResult) {
       scatterOperandIdx = 1;
     } else {
       return failure();
     }
 
-    // The contraction's map for the scattered operand must be a projected
-    // permutation — this ensures the scatter's strided dims map 1:1 to
-    // the contraction's parallel dims (1x1 kernel pattern).
+    // For each strided input dim, the contraction's indexing map must
+    // reference exactly one parallel dim (possibly summed with reduction
+    // dims that have loop bound 1, as in 1x1 convolutions where the map
+    // is `d_spatial + d_kernel` with kernel size 1).
     AffineMap scatterMap = convOp.getIndexingMapsArray()[scatterOperandIdx];
-    if (!scatterMap.isProjectedPermutation()) {
-      return failure();
+    SmallVector<int64_t> loopRanges =
+        cast<linalg::LinalgOp>(convOp.getOperation()).getStaticLoopRanges();
+
+    // For strided dims, verify each map expression resolves to a single
+    // parallel dim (plus optional unit-range reduction dims).
+    for (unsigned d = 0; d < scatterMap.getNumResults(); d++) {
+      if (strides[d] == 1) {
+        continue;
+      }
+      AffineExpr expr = scatterMap.getResult(d);
+      // Collect all dim positions in this expression.
+      SmallVector<unsigned> dimPositions;
+      expr.walk([&](AffineExpr e) {
+        if (auto dim = dyn_cast<AffineDimExpr>(e)) {
+          dimPositions.push_back(dim.getPosition());
+        }
+      });
+      if (dimPositions.empty()) {
+        return failure();
+      }
+      // Exactly one must be a parallel dim; the rest must be reduction
+      // dims with loop bound 1.
+      int parallelCount = 0;
+      auto iterTypes = convOp.getIteratorTypesArray();
+      for (unsigned pos : dimPositions) {
+        if (iterTypes[pos] == utils::IteratorType::parallel) {
+          parallelCount++;
+        } else {
+          if (pos >= loopRanges.size() || loopRanges[pos] != 1) {
+            return failure();
+          }
+        }
+      }
+      if (parallelCount != 1) {
+        return failure();
+      }
     }
 
     // Check contraction body.
@@ -135,18 +175,27 @@ public:
 
     // Compute the new (smaller) result shape: replace the scattered spatial
     // dims with the source spatial dims.
+    auto iterTypes = convOp.getIteratorTypesArray();
     SmallVector<int64_t> newResultShape(resultTy.getShape());
     for (unsigned d = 0; d < rank; d++) {
       if (strides[d] == 1) {
         continue;
       }
-      // Find which contraction dim reads this input dim.
+      // Find the parallel contraction dim that reads this input dim.
+      // The expression may be `d_parallel + d_reduction` for 1x1 convs.
       AffineExpr scatterExpr = scatterMap.getResult(d);
-      auto dimExpr = dyn_cast<AffineDimExpr>(scatterExpr);
-      if (!dimExpr) {
+      int parallelDim = -1;
+      scatterExpr.walk([&](AffineExpr e) {
+        if (auto dim = dyn_cast<AffineDimExpr>(e)) {
+          if (iterTypes[dim.getPosition()] == utils::IteratorType::parallel) {
+            parallelDim = dim.getPosition();
+          }
+        }
+      });
+      if (parallelDim < 0) {
         return failure();
       }
-      unsigned contractionDim = dimExpr.getPosition();
+      unsigned contractionDim = parallelDim;
       // Find which result dim this contraction dim maps to.
       for (auto [resIdx, resExpr] : llvm::enumerate(resultMap.getResults())) {
         auto resDimExpr = dyn_cast<AffineDimExpr>(resExpr);
@@ -285,8 +334,8 @@ public:
     }
 
     auto outputTy = RankedTensorType::get(outputShape, outputElemTy);
-    Value outputZeros = rewriter.create<arith::ConstantOp>(
-        loc,
+    Value outputZeros = arith::ConstantOp::create(
+        rewriter, loc,
         SplatElementsAttr::get(outputTy, rewriter.getZeroAttr(outputElemTy)));
 
     SmallVector<int64_t> newSizes(newResultShape);
@@ -331,4 +380,4 @@ struct SwapStridedScatterWithContractionPass
 };
 
 } // namespace
-} // namespace mlir::iree_compiler::GlobalOptimization
+} // namespace mlir::iree_compiler::Preprocessing
