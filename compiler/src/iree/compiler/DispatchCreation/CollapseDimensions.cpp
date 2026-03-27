@@ -226,14 +226,10 @@ static bool isEligibleForCollapse(Operation *op) {
   // 1D collapse introduces expensive delinearization (div/mod chains) that
   // dominates execution. Keeping the multi-dimensional iteration space
   // allows direct workgroup tiling without delinearization.
-  // This catches both the scf.if variant and the arith.select variant.
   {
     bool hasTensorExtract = false;
     bool hasLinalgIndex = false;
     genericOp.getBlock()->walk([&](Operation *inner) {
-      if (isa<scf::IfOp>(inner)) {
-        hasTensorExtract = true;
-      }
       if (isa<tensor::ExtractOp>(inner)) {
         hasTensorExtract = true;
       }

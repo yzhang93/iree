@@ -80,19 +80,91 @@ public:
     Value src = op.getSource();
     auto srcTy = cast<RankedTensorType>(src.getType());
     auto destTy = cast<RankedTensorType>(dest.getType());
-    unsigned rank = destTy.getRank();
+
+    // Skip conversion when the non-batch passthrough (non-strided)
+    // dimensions carry too many elements per strided spatial position.
+    // In grouped backward-data convolutions the group and channel dims
+    // are passthrough, and when their product is large the scatter
+    // generic wastes cycles broadcasting the same stride predicate
+    // across all inner elements. The hardware DMA path (Memset +
+    // slow_memcpy) is faster in that regime. The outermost (batch)
+    // dimension is excluded because it is a separate parallel loop
+    // that does not affect per-spatial-point scatter cost.
+    {
+      int64_t passthroughElems = 1;
+      for (unsigned i = 1; i < destTy.getRank(); i++) {
+        if (strides[i] == 1 && offsets[i] == 0) {
+          passthroughElems *= destTy.getDimSize(i);
+        }
+      }
+      constexpr int64_t kMaxPassthroughElems = 256;
+      if (passthroughElems > kMaxPassthroughElems) {
+        return failure();
+      }
+    }
+
+    unsigned origRank = destTy.getRank();
     auto elemTy = destTy.getElementType();
     Location loc = op.getLoc();
 
-    Value empty =
-        tensor::EmptyOp::create(rewriter, loc, destTy.getShape(), elemTy);
+    // Collapse contiguous runs of passthrough dims (stride==1, offset==0)
+    // to reduce the iteration rank of the scatter generic. Grouped
+    // backward-data convolutions produce high-rank insert_slices where
+    // only the spatial dims are strided; collapsing the trailing
+    // group+channel dims avoids the GPU having to tile over many
+    // non-strided dimensions that just broadcast the stride predicate.
+    SmallVector<ReassociationIndices> reassociation;
+    {
+      ReassociationIndices currentGroup = {0};
+      for (unsigned i = 1; i < origRank; i++) {
+        bool prevPT = (strides[i - 1] == 1 && offsets[i - 1] == 0);
+        bool currPT = (strides[i] == 1 && offsets[i] == 0);
+        if (prevPT && currPT) {
+          currentGroup.push_back(i);
+        } else {
+          reassociation.push_back(currentGroup);
+          currentGroup = {static_cast<int64_t>(i)};
+        }
+      }
+      reassociation.push_back(currentGroup);
+    }
+    bool needsCollapse =
+        llvm::any_of(reassociation, [](const ReassociationIndices &g) {
+          return g.size() > 1;
+        });
+
+    unsigned rank = reassociation.size();
+    SmallVector<int64_t> wOffsets(rank), wStrides(rank);
+    SmallVector<int64_t> wDestShape(rank), wSrcShape(rank);
+    for (auto [gi, group] : llvm::enumerate(reassociation)) {
+      wOffsets[gi] = offsets[group[0]];
+      wStrides[gi] = strides[group[0]];
+      int64_t dd = 1, sd = 1;
+      for (int64_t idx : group) {
+        dd *= destTy.getDimSize(idx);
+        sd *= srcTy.getDimSize(idx);
+      }
+      wDestShape[gi] = dd;
+      wSrcShape[gi] = sd;
+    }
+
+    auto wSrcTy = RankedTensorType::get(wSrcShape, elemTy);
+    auto wDestTy = RankedTensorType::get(wDestShape, elemTy);
+
+    Value wSrc = src;
+    if (needsCollapse) {
+      wSrc = tensor::CollapseShapeOp::create(rewriter, loc, wSrcTy, src,
+                                             reassociation);
+    }
+
+    Value empty = tensor::EmptyOp::create(rewriter, loc, wDestShape, elemTy);
     AffineMap identityMap = rewriter.getMultiDimIdentityMap(rank);
     SmallVector<AffineMap> indexingMaps = {identityMap};
     SmallVector<utils::IteratorType> iterTypes(rank,
                                                utils::IteratorType::parallel);
 
     auto genericOp = linalg::GenericOp::create(
-        rewriter, loc, destTy, /*inputs=*/ValueRange{},
+        rewriter, loc, wDestTy, /*inputs=*/ValueRange{},
         /*outputs=*/ValueRange{empty}, indexingMaps, iterTypes,
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value allValid = nullptr;
@@ -101,30 +173,30 @@ public:
           for (unsigned i = 0; i < rank; i++) {
             Value idx = linalg::IndexOp::create(b, loc, i);
 
-            if (strides[i] == 1 && offsets[i] == 0) {
+            if (wStrides[i] == 1 && wOffsets[i] == 0) {
               srcIndices.push_back(idx);
               continue;
             }
 
             Value off =
-                arith::ConstantOp::create(b, loc, b.getIndexAttr(offsets[i]));
+                arith::ConstantOp::create(b, loc, b.getIndexAttr(wOffsets[i]));
             Value srcSize = arith::ConstantOp::create(
-                b, loc, b.getIndexAttr(srcTy.getDimSize(i)));
+                b, loc, b.getIndexAttr(wSrcTy.getDimSize(i)));
 
             Value shifted = arith::SubIOp::create(b, loc, idx, off);
 
             Value rem, srcIdx;
-            bool isPow2 = (strides[i] & (strides[i] - 1)) == 0;
+            bool isPow2 = (wStrides[i] & (wStrides[i] - 1)) == 0;
             if (isPow2) {
               Value strideMask = arith::ConstantOp::create(
-                  b, loc, b.getIndexAttr(strides[i] - 1));
+                  b, loc, b.getIndexAttr(wStrides[i] - 1));
               Value log2Stride = arith::ConstantOp::create(
-                  b, loc, b.getIndexAttr(llvm::Log2_64(strides[i])));
+                  b, loc, b.getIndexAttr(llvm::Log2_64(wStrides[i])));
               rem = arith::AndIOp::create(b, loc, shifted, strideMask);
               srcIdx = arith::ShRSIOp::create(b, loc, shifted, log2Stride);
             } else {
-              Value str =
-                  arith::ConstantOp::create(b, loc, b.getIndexAttr(strides[i]));
+              Value str = arith::ConstantOp::create(
+                  b, loc, b.getIndexAttr(wStrides[i]));
               rem = arith::RemSIOp::create(b, loc, shifted, str);
               srcIdx = arith::DivSIOp::create(b, loc, shifted, str);
             }
@@ -142,8 +214,6 @@ public:
                            ? arith::AndIOp::create(b, loc, allValid, dimValid)
                            : dimValid;
 
-            // Clamp to [0, srcSize-1] so the extract is always in-bounds,
-            // even when the predicate is false.
             Value srcSizeM1 = arith::SubIOp::create(
                 b, loc, srcSize,
                 arith::ConstantOp::create(b, loc, b.getIndexAttr(1)));
@@ -161,22 +231,24 @@ public:
                 arith::ConstantOp::create(b, loc, b.getIntegerAttr(elemTy, 0));
           }
 
-          // Always extract (indices are clamped to valid range).
-          Value extracted = tensor::ExtractOp::create(b, loc, src, srcIndices);
+          Value extracted = tensor::ExtractOp::create(b, loc, wSrc, srcIndices);
 
           if (!allValid) {
-            // No strided dims had predicates; just yield the extracted value.
             linalg::YieldOp::create(b, loc, extracted);
             return;
           }
 
-          // Select between extracted value and zero based on predicate.
           Value result =
               arith::SelectOp::create(b, loc, allValid, extracted, zeroElem);
           linalg::YieldOp::create(b, loc, result);
         });
 
-    rewriter.replaceOp(op, genericOp.getResult(0));
+    Value result = genericOp.getResult(0);
+    if (needsCollapse) {
+      result = tensor::ExpandShapeOp::create(rewriter, loc, destTy, result,
+                                             reassociation);
+    }
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
