@@ -170,6 +170,16 @@ buildMakeSingleDispatchPassPipeline(OpPassManager &passManager,
           /*fuseTruncateOps=*/true}));
 }
 
+static void buildBackwardDataConvPassPipeline(OpPassManager &passManager,
+                                              const TransformOptions &options) {
+  passManager.addPass(createSwapStridedScatterWithContractionPass());
+  passManager.addPass(createConvertStridedInsertSliceToGenericPass());
+  FunctionLikeNest(passManager)
+      .addPass(createConvertConvFilterToChannelsLastPass);
+  passManager.addPass(createCanonicalizerPass());
+  passManager.addPass(createCSEPass());
+}
+
 void registerPreprocessingPasses() {
   registerCommonPreprocessingPasses();
 
@@ -182,6 +192,17 @@ void registerPreprocessingPasses() {
              const TransformOptions &transformOptions) {
             buildTransposeConvolutionPassPipeline(passManager,
                                                   transformOptions);
+          });
+
+  PassPipelineRegistration<TransformOptions>
+      preprocessingBackwardDataConvPassPipeline(
+          "iree-preprocessing-backward-data-conv-pipeline",
+          "Runs passes for backward-data convolutions (swap scatter with "
+          "contraction, convert strided insert_slice to generic, convert "
+          "conv filter to channels-last)",
+          [](OpPassManager &passManager,
+             const TransformOptions &transformOptions) {
+            buildBackwardDataConvPassPipeline(passManager, transformOptions);
           });
 
   PassPipelineRegistration<TransformOptions>
