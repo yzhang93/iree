@@ -79,7 +79,13 @@ struct GPUIntrinsicType : GPUMatmulShapeType {
 struct GPUMMAHeuristicSeeds {
   // The best number of subgroups to use per workgroup
   int64_t bestSubgroupCountPerWorkgroup = 0;
-  // The best number of total tiles along M*N dimensions per subgroup
+  // The best number of total tiles along M*N dimensions per subgroup.
+  //
+  // For SKU-tuned LargeGemm seeds (those that also set
+  // `maxOutputVGPRsPerThread`), this is the base value;
+  // `adjustSeedsForTarget` will either double this (boosted shape) or
+  // double `bestSubgroupCountPerWorkgroup` (uplifted shape) depending on
+  // whether the boosted shape fits the problem.
   int64_t bestMNTileCountPerSubgroup = 0;
   // The best number of tiles along K dimension per subgroup
   int64_t bestKTileCountPerSubgroup = 0;
@@ -88,23 +94,19 @@ struct GPUMMAHeuristicSeeds {
   // some chosen intrinsic `bestIntrinsic`.
   int64_t bestKElementCountPerSubgroup = 0;
   // Optional minimum GPU utilization threshold for seed adjustment. When set,
-  // adjustSeedsForTarget will boost MNT for balanced large GEMMs and then
-  // halve MNT until utilization meets this threshold. GPU utilization is
-  // defined as numWorkgroups / (numWaves * numCUs), where numWaves =
+  // adjustSeedsForTarget will halve bestMNTileCountPerSubgroup until GPU
+  // utilization meets this threshold. GPU utilization is defined as
+  // numWorkgroups / (numWaves * numCUs), where numWaves =
   // ceil(numWorkgroups / numCUs). A threshold of 0.50 means at least 50% of
   // CU-slots in the last wave must be occupied.
   std::optional<double> minUtilizationThreshold = std::nullopt;
-  // Optional MN tile count boost target for GEMMs with balanced K (i.e.,
-  // K <= max(M, N)). When set, adjustSeedsForTarget will boost
-  // bestMNTileCountPerSubgroup to at least this value, provided the output
-  // tensor is large enough to keep the GPU busy at the boosted tile size. A
-  // higher value increases per-workgroup compute density (more output elements
-  // per workgroup), which can improve performance when the GPU has enough work
-  // to stay saturated.
-  std::optional<int64_t> boostMNTileCountPerSubgroup = std::nullopt;
-  // Maximum output VGPRs per thread for the VGPR pressure cap. When set,
-  // adjustSeedsForTarget will reduce bestMNTileCountPerSubgroup to keep
-  // per-thread output register pressure within this limit.
+  // Maximum output VGPRs per thread for the VGPR pressure cap, set only for
+  // SKU-tuned seeds (e.g. MI350X / MI355X LargeGemm). When set,
+  // `adjustSeedsForTarget` treats the seed as holding the "boosted"
+  // workgroup shape: it falls back to the standard shape for problems where
+  // the boost isn't appropriate, and later caps
+  // `bestMNTileCountPerSubgroup` so per-thread output register pressure
+  // stays within this limit.
   std::optional<int64_t> maxOutputVGPRsPerThread = std::nullopt;
 };
 

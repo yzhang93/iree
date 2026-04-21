@@ -817,30 +817,47 @@ sortMMAIntrinsics(GPUMatmulShapeType problem,
   return sortedIntrinsics;
 }
 
-/// Returns true when the MNT-boost path in `adjustSeedsForTarget` will be
-/// entered for this (target, seeds) pair. Used as the gate for the SKU
-/// subgroup uplift (which the boost halves back to offset).
-static bool hasMNTBoost(IREE::GPU::TargetAttr target,
-                        const GPUMMAHeuristicSeeds &seeds) {
-  return seeds.boostMNTileCountPerSubgroup.has_value() && target &&
-         target.getChip();
-}
-
-/// Returns true when the MNT boost will both enter the K-balanced branch and
-/// actually fire its per-workgroup boost for this problem. Unlike
-/// `hasMNTBoost`, this also checks the shape-level `!kDominated` bail-out;
-/// used by `deduceMMASchedule` to align intrinsic selection with boost
-/// firing, avoiding the "prefer 32x32" regression for K-dominated shapes.
-static bool mntBoostApplies(IREE::GPU::TargetAttr target,
-                            const GPUMMAHeuristicSeeds &seeds,
-                            const GPUMatmulShapeType &problem) {
-  if (!hasMNTBoost(target, seeds)) {
+/// Returns true when the target is SKU-tuned for LargeGemm on a balanced-K
+/// problem: the seed has `maxOutputVGPRsPerThread` set (indicating it stores
+/// the boosted shape), the target has chip info, and K is not dominated
+/// (K <= max(M, N)). Used by `deduceMMASchedule` to gate the
+/// compute-throughput-first intrinsic preference.
+static bool isSKUTunedLargeGemmBalanced(IREE::GPU::TargetAttr target,
+                                        const GPUMMAHeuristicSeeds &seeds,
+                                        const GPUMatmulShapeType &problem) {
+  if (!seeds.maxOutputVGPRsPerThread || !target || !target.getChip()) {
     return false;
   }
   int64_t mSize = ShapedType::getNumElements(problem.mSizes);
   int64_t nSize = ShapedType::getNumElements(problem.nSizes);
   int64_t kSize = ShapedType::getNumElements(problem.kSizes);
   return kSize <= std::max(mSize, nSize);
+}
+
+/// Returns true when the MNT boost (doubling `bestMNTileCountPerSubgroup`)
+/// should be applied for this problem. Requires the target to be SKU-tuned
+/// for balanced-K LargeGemm (see `isSKUTunedLargeGemmBalanced`) and the
+/// output to span enough waves of the uplifted (2x subgroups) workgroup to
+/// justify trading subgroups for per-subgroup tiles.
+static bool shouldApplyMNTBoost(IREE::GPU::TargetAttr target,
+                                const GPUMMAHeuristicSeeds &seeds,
+                                const GPUMatmulShapeType &problem,
+                                const GPUIntrinsicType &intrinsic,
+                                int64_t wgpCount) {
+  if (!isSKUTunedLargeGemmBalanced(target, seeds, problem)) {
+    return false;
+  }
+  // Threshold: need the output to cover ~2 waves of the boosted workgroup,
+  // which has MNT = 2 * seed.MNT and subgroups = 2 * seed.subgroups when
+  // expressed against the uplifted (fallback) shape. Numerically matches
+  // the legacy boost gate.
+  int64_t mSize = ShapedType::getNumElements(problem.mSizes);
+  int64_t nSize = ShapedType::getNumElements(problem.nSizes);
+  int64_t boostedMNT = 2 * seeds.bestMNTileCountPerSubgroup;
+  int64_t upliftedSubgroups = 2 * seeds.bestSubgroupCountPerWorkgroup;
+  int64_t refWGOutputElements = boostedMNT * upliftedSubgroups *
+                                intrinsic.mSizes[0] * intrinsic.nSizes[0];
+  return mSize * nSize >= 2 * wgpCount * refWGOutputElements;
 }
 
 static int64_t computeEstimatedWorkgroupCount(const GPUMMAHeuristicSeeds &seeds,
@@ -862,16 +879,15 @@ static int64_t computeEstimatedWorkgroupCount(const GPUMMAHeuristicSeeds &seeds,
 }
 
 /// Adjust M*N tile-count (bestMNTileCountPerSubgroup) seeds based on target
-/// hardware and problem characteristics. Five independent adjustments,
+/// hardware and problem characteristics. Four independent adjustments,
 /// applied in order:
-/// 0. SKU subgroup uplift (when maxOutputVGPRsPerThread is set): doubles
-///    bestSubgroupCountPerWorkgroup for SKU-tuned targets that pair a larger
-///    workgroup with the VGPR cap. May be halved back by step 2 when the
-///    MNT boost fires, keeping the total workgroup footprint in check.
-/// 1. Baseline (all targets): reduces bestMNTileCountPerSubgroup until the
+/// 1. SKU-tuned workgroup shape (when maxOutputVGPRsPerThread is set):
+///    pick between the boosted shape (MNT *= 2) for balanced-K large
+///    GEMMs with enough output, and the uplifted shape (subgroups *= 2)
+///    otherwise on SKU-tuned chips. Targets without chip info keep the
+///    base seed.
+/// 2. Baseline (all targets): reduces bestMNTileCountPerSubgroup until the
 ///    estimated workgroup count fills all CUs.
-/// 2. Tile-count boost (when boostMNTileCountPerSubgroup is set): for GEMMs
-///    with balanced K, boosts tile count to the architecture-specific target.
 /// 3. Utilization guard (when minUtilizationThreshold is set): halves tile
 ///    count until GPU utilization meets the threshold.
 /// 4. VGPR pressure cap: limits MN tile count based on per-thread output
@@ -883,10 +899,6 @@ static void adjustSeedsForTarget(GPUMMAHeuristicSeeds &seeds,
                                  int64_t splitReductionTripCnt) {
   IREE::GPU::TargetChipAttr chip = target ? target.getChip() : nullptr;
   int64_t wgpCount = chip ? chip.getWgpCount() : 0;
-  if (wgpCount == 0) {
-    LDBG() << "WGP count unavailable, skipping seed adjustment.";
-    return;
-  }
 
   if (!problem.gemmSize || problem.gemmSize == GemmSizeKind::SmallGemm) {
     LDBG() << "Arithmetic intensity is too low, "
@@ -894,17 +906,27 @@ static void adjustSeedsForTarget(GPUMMAHeuristicSeeds &seeds,
     return;
   }
 
-  // SKU uplift: targets that set `maxOutputVGPRsPerThread` (e.g. MI350X /
-  // MI355X LargeGemm) benefit from 2x the baseline subgroup count per
-  // workgroup. Matches the effective `bestSubgroupCountPerWorkgroup = 8`
-  // bake-in from the original SKU tuning: applies for both balanced-K
-  // shapes (where the boost fires and halves this back, netting to 4) and
-  // K-dominated shapes (where the boost skips but a wider workgroup still
-  // helps, e.g. large-K GEMMs on MI355X).
-  if (seeds.maxOutputVGPRsPerThread && hasMNTBoost(target, seeds)) {
-    seeds.bestSubgroupCountPerWorkgroup *= 2;
-    LDBG() << "SKU uplift: doubling subgroup count to "
-           << seeds.bestSubgroupCountPerWorkgroup;
+  // SKU-tuned LargeGemm (signaled by maxOutputVGPRsPerThread). Both the
+  // "boosted" shape (MNT *= 2) and the "uplifted" shape (subgroups *= 2)
+  // produce the same per-workgroup tile count but trade per-subgroup tiles
+  // for subgroup count. Pick boosted for balanced-K shapes with enough
+  // output to saturate the GPU; otherwise uplift. Non-SKU-tuned targets
+  // (no chip info) keep the base seed untouched.
+  if (seeds.maxOutputVGPRsPerThread) {
+    if (shouldApplyMNTBoost(target, seeds, problem, intrinsic, wgpCount)) {
+      seeds.bestMNTileCountPerSubgroup *= 2;
+      LDBG() << "MNT boost applied: bestMNTileCountPerSubgroup = "
+             << seeds.bestMNTileCountPerSubgroup;
+    } else if (chip) {
+      seeds.bestSubgroupCountPerWorkgroup *= 2;
+      LDBG() << "SKU subgroup uplift: bestSubgroupCountPerWorkgroup = "
+             << seeds.bestSubgroupCountPerWorkgroup;
+    }
+  }
+
+  if (wgpCount == 0) {
+    LDBG() << "WGP count unavailable, skipping CU-aware seed adjustments.";
+    return;
   }
 
   // Baseline for all architectures: reduce MNT until workgroups fill CUs.
@@ -924,34 +946,6 @@ static void adjustSeedsForTarget(GPUMMAHeuristicSeeds &seeds,
            << seeds.bestMNTileCountPerSubgroup;
     numWorkgroups = computeEstimatedWorkgroupCount(seeds, problem, intrinsic,
                                                    splitReductionTripCnt);
-  }
-
-  // For GEMMs with balanced K dimensions (K <= max(M, N)), boost MNT to the
-  // architecture-specific target to improve per-workgroup compute density
-  // (more output elements per workgroup). The workload benefits from wider M*N
-  // tiles rather than deeper K unrolling.
-  if (seeds.boostMNTileCountPerSubgroup) {
-    int64_t boostMNT = *seeds.boostMNTileCountPerSubgroup;
-    int64_t mSize = ShapedType::getNumElements(problem.mSizes);
-    int64_t nSize = ShapedType::getNumElements(problem.nSizes);
-    int64_t kSize = ShapedType::getNumElements(problem.kSizes);
-    int64_t boostedWGSize = boostMNT * intrinsic.mSizes[0] *
-                            intrinsic.nSizes[0] *
-                            seeds.bestSubgroupCountPerWorkgroup;
-    bool kDominated = kSize > std::max(mSize, nSize);
-    bool enoughOutput = mSize * nSize >= 2 * wgpCount * boostedWGSize;
-    if (!kDominated && enoughOutput) {
-      seeds.bestMNTileCountPerSubgroup =
-          std::max(seeds.bestMNTileCountPerSubgroup, boostMNT);
-      LDBG() << "Boosting MNT to " << seeds.bestMNTileCountPerSubgroup
-             << " for balanced large gemm";
-      // Halve subgroup count to offset the MNT boost, keeping the total
-      // workgroup resource footprint (threads, LDS) in check for occupancy.
-      seeds.bestSubgroupCountPerWorkgroup =
-          std::max<int64_t>(1, seeds.bestSubgroupCountPerWorkgroup / 2);
-      LDBG() << "Halving subgroup count to "
-             << seeds.bestSubgroupCountPerWorkgroup << " to offset MNT boost";
-    }
   }
 
   // When a utilization threshold is set and workgroup count barely exceeds a
@@ -983,12 +977,12 @@ static void adjustSeedsForTarget(GPUMMAHeuristicSeeds &seeds,
   }
 
   // Cap per-subgroup MN tile count based on output VGPR pressure from the
-  // selected intrinsic. Only applies when the MNT boost (step 2) is
-  // configured, since the boost can push MN tile counts high enough to
-  // cause spilling with large-output intrinsics (32x32). Capping at 128
-  // output VGPRs per thread (8 MN tiles for 32x32, 32 for 16x16) prevents
-  // spilling while preserving the boost for intrinsics that can handle
-  // higher tile counts.
+  // selected intrinsic. Only applies for SKU-tuned seeds (those that set
+  // `maxOutputVGPRsPerThread`), since the boosted seed can push MN tile
+  // counts high enough to cause spilling with large-output intrinsics
+  // (32x32). Capping at 128 output VGPRs per thread (8 MN tiles for 32x32,
+  // 32 for 16x16) prevents spilling while preserving the boost for
+  // intrinsics that can handle higher tile counts.
   if (seeds.maxOutputVGPRsPerThread) {
     int64_t subgroupSize = target.getPreferredSubgroupSize();
     int64_t outputVGPRsPerTile =
@@ -1014,13 +1008,13 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
 
   // Prefer higher-compute intrinsics (e.g., 32x32x16 over 16x16x32) for:
   //  - VeryLargeGemm: always compute-bound, higher throughput wins.
-  //  - LargeGemm on SKU-tuned CDNA4 targets, only when the MNT boost would
-  //    actually fire for this shape (see `mntBoostApplies`). Gated by
-  //    !doCPromotion to avoid regressing addmm shapes that need accumulator
-  //    promotion to shared memory.
+  //  - LargeGemm on SKU-tuned CDNA4 targets with balanced K
+  //    (see `isSKUTunedLargeGemmBalanced`). Gated by !doCPromotion to avoid
+  //    regressing addmm shapes that need accumulator promotion to shared
+  //    memory.
   bool isLargeGemmWithSkuBoost =
       problem.gemmSize == GemmSizeKind::LargeGemm && !doCPromotion &&
-      mntBoostApplies(target, seeds, problem);
+      isSKUTunedLargeGemmBalanced(target, seeds, problem);
   bool preferHighComputeIntrinsic =
       problem.gemmSize == GemmSizeKind::VeryLargeGemm ||
       isLargeGemmWithSkuBoost;

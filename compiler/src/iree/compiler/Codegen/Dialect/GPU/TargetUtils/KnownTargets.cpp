@@ -1342,34 +1342,29 @@ static constexpr ArchSeedSet kDefaultSeeds = {
     },
 };
 
-/// CDNA4 seeds use the default values plus utilization-aware MNT tuning.
-/// The boostMNTileCountPerSubgroup of 32 was empirically determined by
-/// benchmarking large GEMM shapes (e.g. 4096x4096x4096) on MI350 to balance
-/// per-workgroup compute density against register pressure and occupancy.
+/// SKU-tuning fields applied on top of the default LargeGemm seed for
+/// CDNA4 chip-aware targets (MI350X / MI355X). These signal
+/// `adjustSeedsForTarget` to select between the "boosted" workgroup shape
+/// (MNT *= 2, used for balanced-K large GEMMs with enough output) and the
+/// "uplifted" shape (subgroups *= 2, used otherwise). Both shapes have the
+/// same per-workgroup tile count -- the choice trades per-subgroup tiles
+/// for more subgroups per workgroup. Bare gfx950 (no chip info) ignores
+/// these fields and keeps the base seed. See `adjustSeedsForTarget` in
+/// GPUHeuristics.cpp.
 /// TODO: Link to iree-org/iree discussion with full benchmarking methodology.
-static constexpr ArchSeedSet kCDNA4Seeds = {
-    /*gemm=*/{
-        /*SmallGemm=*/     {2, 2,  4, 2 * kCacheLineSizeBits},
-        /*MediumGemm=*/    {4, 8,  4, 2 * kCacheLineSizeBits},
-        /*LargeGemm=*/     {4, 16, 2, kCacheLineSizeBits / 2,
-                            /*minUtilizationThreshold=*/0.50,
-                            /*boostMNTileCountPerSubgroup=*/32,
-                            /*maxOutputVGPRsPerThread=*/128},
-        /*VeryLargeGemm=*/ {4, 16, 2, kCacheLineSizeBits / 2},
-    },
-    /*scaledGemm=*/{
-        /*SmallGemm=*/     {2, 2,  4, 2 * kCacheLineSizeBits},
-        /*MediumGemm=*/    {8, 32, 4, kCacheLineSizeBits / 2},
-        /*LargeGemm=*/     {8, 32, 2, kCacheLineSizeBits / 2},
-        /*VeryLargeGemm=*/ {8, 32, 2, kCacheLineSizeBits / 2},
-    },
-    /*conv=*/{
-        /*SmallGemm=*/     {2, 2,  4, kCacheLineSizeBits},
-        /*MediumGemm=*/    {8, 4,  4, 2 * kCacheLineSizeBits},
-        /*LargeGemm=*/     {8, 8,  2, kCacheLineSizeBits / 2},
-        /*VeryLargeGemm=*/ {8, 8,  2, kCacheLineSizeBits / 2},
-    },
-};
+static constexpr double kCDNA4LargeGemmMinUtilThreshold = 0.50;
+static constexpr int64_t kCDNA4LargeGemmMaxOutputVGPRsPerThread = 128;
+
+/// CDNA4 seeds are identical to the defaults except for the LargeGemm
+/// SKU-tuning fields above. Built at static-init time because
+/// `std::optional::operator=` isn't constexpr until C++20.
+static const ArchSeedSet kCDNA4Seeds = [] {
+  ArchSeedSet seeds = kDefaultSeeds;
+  auto &largeGemm = seeds.gemm[static_cast<int>(GemmSizeKind::LargeGemm)];
+  largeGemm.minUtilizationThreshold = kCDNA4LargeGemmMinUtilThreshold;
+  largeGemm.maxOutputVGPRsPerThread = kCDNA4LargeGemmMaxOutputVGPRsPerThread;
+  return seeds;
+}();
 
 /// RDNA4 seeds (tuned based on RX 9070 XT benchmarking data).
 static constexpr ArchSeedSet kRDNA4Seeds = {

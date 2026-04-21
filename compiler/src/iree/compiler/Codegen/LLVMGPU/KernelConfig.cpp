@@ -362,8 +362,7 @@ setConvolutionVectorDistributionConfig(IREE::GPU::TargetAttr target,
                              /*bestMNTileCountPerSubgroup=*/8,
                              /*bestKTileCountPerSubgroup=*/2,
                              /*bestKElementCountPerSubgroup=*/0,
-                             archGemmSeeds.minUtilizationThreshold,
-                             archGemmSeeds.boostMNTileCountPerSubgroup};
+                             archGemmSeeds.minUtilizationThreshold};
 
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
 
@@ -610,15 +609,13 @@ setMatmulVectorDistributionConfig(IREE::GPU::TargetAttr target,
              /*bestMNTileCountPerSubgroup=*/4,
              /*bestKTileCountPerSubgroup=*/8,
              /*bestKElementCountPerSubgroup=*/0,
-             defaultGemmSeeds.minUtilizationThreshold,
-             defaultGemmSeeds.boostMNTileCountPerSubgroup};
+             defaultGemmSeeds.minUtilizationThreshold};
   } else {
     seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
              /*bestMNTileCountPerSubgroup=*/8,
              /*bestKTileCountPerSubgroup=*/4,
              /*bestKElementCountPerSubgroup=*/0,
-             defaultGemmSeeds.minUtilizationThreshold,
-             defaultGemmSeeds.boostMNTileCountPerSubgroup};
+             defaultGemmSeeds.minUtilizationThreshold};
   }
   // Scale the seed by number of contractions of horizontally fused case.
   seeds.bestMNTileCountPerSubgroup /= op.getNumDpsInputs() - 1;
