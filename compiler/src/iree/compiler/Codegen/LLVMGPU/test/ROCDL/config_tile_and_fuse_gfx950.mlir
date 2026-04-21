@@ -394,8 +394,9 @@ func.func @matmul_f16_compute_bound(
 
 // MI355X-specific (CDNA4) heuristic tests: MI355X targets gfx950 with chip
 // info (wgpCount=256), enabling utilization-aware MNT boosting for balanced
-// large GEMMs. These tests verify that the boosted config differs from bare
-// gfx950 (which has no chip info).
+// large GEMMs. These tests pin the per-target config so the SKU-tuned
+// (MI355X) path can be compared against the bare gfx950 baseline (no chip
+// info) under the same shapes.
 
 // LargeGemm — symmetric (4096x4096x4096)
 // Balanced K (K == M == N), so MNT gets boosted to 32.
@@ -409,6 +410,16 @@ func.func @matmul_large_symmetric_f16(
                           outs(%fill : tensor<4096x4096xf32>) -> tensor<4096x4096xf32>
   return %result : tensor<4096x4096xf32>
 }
+
+// CHECK-LABEL: func.func @matmul_large_symmetric_f16
+//  CHECK-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
+//  CHECK-SAME:   workgroup_size = [256, 1, 1] subgroup_size = 64
+//       CHECK:   linalg.matmul {{.*}}lowering_config = #iree_gpu.lowering_config
+//  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F16>
+//  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     reduction = [0, 0, 1]
+//  CHECK-SAME:     subgroup = [4, 4, 0]
+//  CHECK-SAME:     workgroup = [128, 128, 0]
 
 // MI355X-LABEL: func.func @matmul_large_symmetric_f16
 //  MI355X-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
@@ -435,6 +446,16 @@ func.func @matmul_large_tall_m_f16(
   return %result : tensor<21760x3840xf32>
 }
 
+// CHECK-LABEL: func.func @matmul_large_tall_m_f16
+//  CHECK-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
+//  CHECK-SAME:   workgroup_size = [256, 1, 1] subgroup_size = 64
+//       CHECK:   linalg.matmul {{.*}}lowering_config = #iree_gpu.lowering_config
+//  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F16>
+//  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     reduction = [0, 0, 1]
+//  CHECK-SAME:     subgroup = [4, 4, 0]
+//  CHECK-SAME:     workgroup = [128, 128, 0]
+
 // MI355X-LABEL: func.func @matmul_large_tall_m_f16
 //  MI355X-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
 //  MI355X-SAME:   workgroup_size = [512, 1, 1] subgroup_size = 64
@@ -459,6 +480,16 @@ func.func @matmul_large_wide_n_f16(
                           outs(%fill : tensor<4096x8192xf32>) -> tensor<4096x8192xf32>
   return %result : tensor<4096x8192xf32>
 }
+
+// CHECK-LABEL: func.func @matmul_large_wide_n_f16
+//  CHECK-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
+//  CHECK-SAME:   workgroup_size = [256, 1, 1] subgroup_size = 64
+//       CHECK:   linalg.matmul {{.*}}lowering_config = #iree_gpu.lowering_config
+//  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F16>
+//  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     reduction = [0, 0, 1]
+//  CHECK-SAME:     subgroup = [4, 4, 0]
+//  CHECK-SAME:     workgroup = [128, 128, 0]
 
 // MI355X-LABEL: func.func @matmul_large_wide_n_f16
 //  MI355X-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
@@ -485,6 +516,17 @@ func.func @matmul_large_very_tall_m_f16(
                           outs(%fill : tensor<150000x4096xf32>) -> tensor<150000x4096xf32>
   return %result : tensor<150000x4096xf32>
 }
+
+// CHECK-LABEL: func.func @matmul_large_very_tall_m_f16
+//  CHECK-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>
+//  CHECK-SAME:   workgroup_size = [256, 1, 1] subgroup_size = 64
+//       CHECK:   linalg.matmul {{.*}}lowering_config = #iree_gpu.lowering_config
+//  CHECK-SAME:     mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F16>
+//  CHECK-SAME:     padding = [128, 128, 32]
+//  CHECK-SAME:     promote_operands = [0, 1]
+//  CHECK-SAME:     reduction = [0, 0, 1]
+//  CHECK-SAME:     subgroup = [4, 4, 0]
+//  CHECK-SAME:     workgroup = [128, 128, 0]
 
 // MI355X-LABEL: func.func @matmul_large_very_tall_m_f16
 //  MI355X-SAME:   #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse>

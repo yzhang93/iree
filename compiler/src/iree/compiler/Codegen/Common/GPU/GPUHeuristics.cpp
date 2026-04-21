@@ -817,6 +817,32 @@ sortMMAIntrinsics(GPUMatmulShapeType problem,
   return sortedIntrinsics;
 }
 
+/// Returns true when the MNT-boost path in `adjustSeedsForTarget` will be
+/// entered for this (target, seeds) pair. Used as the gate for the SKU
+/// subgroup uplift (which the boost halves back to offset).
+static bool hasMNTBoost(IREE::GPU::TargetAttr target,
+                        const GPUMMAHeuristicSeeds &seeds) {
+  return seeds.boostMNTileCountPerSubgroup.has_value() && target &&
+         target.getChip();
+}
+
+/// Returns true when the MNT boost will both enter the K-balanced branch and
+/// actually fire its per-workgroup boost for this problem. Unlike
+/// `hasMNTBoost`, this also checks the shape-level `!kDominated` bail-out;
+/// used by `deduceMMASchedule` to align intrinsic selection with boost
+/// firing, avoiding the "prefer 32x32" regression for K-dominated shapes.
+static bool mntBoostApplies(IREE::GPU::TargetAttr target,
+                            const GPUMMAHeuristicSeeds &seeds,
+                            const GPUMatmulShapeType &problem) {
+  if (!hasMNTBoost(target, seeds)) {
+    return false;
+  }
+  int64_t mSize = ShapedType::getNumElements(problem.mSizes);
+  int64_t nSize = ShapedType::getNumElements(problem.nSizes);
+  int64_t kSize = ShapedType::getNumElements(problem.kSizes);
+  return kSize <= std::max(mSize, nSize);
+}
+
 static int64_t computeEstimatedWorkgroupCount(const GPUMMAHeuristicSeeds &seeds,
                                               const GPUMatmulShapeType &problem,
                                               const GPUIntrinsicType &intrinsic,
@@ -836,8 +862,12 @@ static int64_t computeEstimatedWorkgroupCount(const GPUMMAHeuristicSeeds &seeds,
 }
 
 /// Adjust M*N tile-count (bestMNTileCountPerSubgroup) seeds based on target
-/// hardware and problem characteristics. Four independent adjustments, applied
-/// in order:
+/// hardware and problem characteristics. Five independent adjustments,
+/// applied in order:
+/// 0. SKU subgroup uplift (when maxOutputVGPRsPerThread is set): doubles
+///    bestSubgroupCountPerWorkgroup for SKU-tuned targets that pair a larger
+///    workgroup with the VGPR cap. May be halved back by step 2 when the
+///    MNT boost fires, keeping the total workgroup footprint in check.
 /// 1. Baseline (all targets): reduces bestMNTileCountPerSubgroup until the
 ///    estimated workgroup count fills all CUs.
 /// 2. Tile-count boost (when boostMNTileCountPerSubgroup is set): for GEMMs
@@ -862,6 +892,19 @@ static void adjustSeedsForTarget(GPUMMAHeuristicSeeds &seeds,
     LDBG() << "Arithmetic intensity is too low, "
            << "skipping adjustment of seeds for workgroup count.";
     return;
+  }
+
+  // SKU uplift: targets that set `maxOutputVGPRsPerThread` (e.g. MI350X /
+  // MI355X LargeGemm) benefit from 2x the baseline subgroup count per
+  // workgroup. Matches the effective `bestSubgroupCountPerWorkgroup = 8`
+  // bake-in from the original SKU tuning: applies for both balanced-K
+  // shapes (where the boost fires and halves this back, netting to 4) and
+  // K-dominated shapes (where the boost skips but a wider workgroup still
+  // helps, e.g. large-K GEMMs on MI355X).
+  if (seeds.maxOutputVGPRsPerThread && hasMNTBoost(target, seeds)) {
+    seeds.bestSubgroupCountPerWorkgroup *= 2;
+    LDBG() << "SKU uplift: doubling subgroup count to "
+           << seeds.bestSubgroupCountPerWorkgroup;
   }
 
   // Baseline for all architectures: reduce MNT until workgroups fill CUs.
@@ -971,15 +1014,16 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
 
   // Prefer higher-compute intrinsics (e.g., 32x32x16 over 16x16x32) for:
   //  - VeryLargeGemm: always compute-bound, higher throughput wins.
-  //  - LargeGemm on architectures with MNT boost (e.g., CDNA4): the boost
-  //    indicates the target benefits from larger output tiles. Gated by
+  //  - LargeGemm on SKU-tuned CDNA4 targets, only when the MNT boost would
+  //    actually fire for this shape (see `mntBoostApplies`). Gated by
   //    !doCPromotion to avoid regressing addmm shapes that need accumulator
   //    promotion to shared memory.
-  bool isLargeGemmWithBoost = problem.gemmSize == GemmSizeKind::LargeGemm &&
-                              seeds.boostMNTileCountPerSubgroup.has_value() &&
-                              !doCPromotion;
+  bool isLargeGemmWithSkuBoost =
+      problem.gemmSize == GemmSizeKind::LargeGemm && !doCPromotion &&
+      mntBoostApplies(target, seeds, problem);
   bool preferHighComputeIntrinsic =
-      problem.gemmSize == GemmSizeKind::VeryLargeGemm || isLargeGemmWithBoost;
+      problem.gemmSize == GemmSizeKind::VeryLargeGemm ||
+      isLargeGemmWithSkuBoost;
   SmallVector<GPUIntrinsicType> sortedIntrinsics =
       sortMMAIntrinsics(problem, intrinsics, preferHighComputeIntrinsic);
 
