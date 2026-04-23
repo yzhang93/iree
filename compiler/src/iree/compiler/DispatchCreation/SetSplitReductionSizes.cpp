@@ -238,6 +238,14 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
   const int64_t largeParallelSize = 640000;
   const int64_t largeReductionSize = 8192;
   const int64_t ratioThreshold = 64;
+  // Additional "no-split" threshold: when the output is very large but the
+  // reduction is modest, splitting introduces overhead (extra workgroups,
+  // partial-result reductions) that the per-split compute work is too small
+  // to amortise. Derived from an all_weight_shapes_conv sweep -- on shapes
+  // in this regime the sweep measured >=1.15x speedup when *no* split
+  // reduction was applied.
+  const int64_t hugeOutputSize = 2 * 1024 * 1024;
+  const int64_t modestReductionSize = 50000;
 
   // When the parallel dimension sizes are large, the workload tends to
   // distributed across many workgroups, making split reduction little to no
@@ -254,9 +262,16 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
   // reduction often has no effect or even degrades performance.
   SmallVector<int64_t> tileSizes = std::move(*maybeSizes);
   int64_t reductionSize = llvm::product_of(tileSizes);
+  int64_t outputSize = outputChannelSize * batchSize * imageSize * depthSize;
   int64_t ratio = reductionSize / std::sqrt(parallelSize);
   if (ratio <= ratioThreshold && reductionSize < largeReductionSize) {
     LDBG() << "skipping op; small reduction size";
+    return std::nullopt;
+  }
+
+  // Huge output with modest reduction: data-driven "don't split" regime.
+  if (outputSize >= hugeOutputSize && reductionSize < modestReductionSize) {
+    LDBG() << "skipping op; huge output with modest reduction";
     return std::nullopt;
   }
 
@@ -264,20 +279,55 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
   // For larger outputs, the workload tends to be distributed across more
   // workgroups, thereby reducing the need for extensive splitting along the
   // reduction dimensions.
-  int64_t outputSize = outputChannelSize * batchSize * imageSize * depthSize;
   int64_t startTileSize =
       isBatchFirstLayout ? tileSizes.back() : tileSizes.front();
   int64_t limitParallelLoops;
+  // The 2D (outputSize, reductionSize) heuristic below was derived from an
+  // all_weight_shapes_conv sweep: relative to a 1D outputSize-only heuristic
+  // it produced a net ~1.08x on the swept dataset by recognising that,
+  // inside each outputSize band, the optimal number of reduction splits
+  // depends on how much reduction work there is.
+  //   - outputSize < 1024: need maximal splitting.
+  //   - 1K..16K: baseline (128) is already reasonable.
+  //   - 16K..64K: baseline=64 over-splits when reductionSize is modest; split
+  //     less when there is less reduction work.
+  //   - 64K..256K: baseline=16 under-splits when reductionSize is huge; split
+  //     more aggressively (64) in that regime.
+  //   - >= 256K: baseline=min(8,startTileSize) is usually right, but large
+  //     outputs with huge reduction benefit from slightly more splitting
+  //     (16). The "huge output + modest reduction" case is handled by the
+  //     early return above.
   if (outputSize < 32 * 32) {
     limitParallelLoops = 2048;
   } else if (outputSize < 128 * 128) {
     limitParallelLoops = 128;
   } else if (outputSize < 256 * 256) {
-    limitParallelLoops = 64;
+    if (reductionSize < 50000) {
+      limitParallelLoops = 16;
+    } else if (reductionSize < 200000) {
+      limitParallelLoops = 32;
+    } else {
+      limitParallelLoops = 64;
+    }
   } else if (outputSize < 512 * 512) {
+    if (reductionSize >= 200000) {
+      limitParallelLoops = 64;
+    } else {
+      limitParallelLoops = 16;
+    }
+  } else if (outputSize >= 1024 * 1024 && reductionSize >= 200000) {
     limitParallelLoops = 16;
   } else {
     limitParallelLoops = std::min<int64_t>(8, startTileSize);
+  }
+
+  // limitParallelLoops <= 1 means "no splitting" -- the loop below would keep
+  // tileSizes equal to the full reduction dim sizes and still attach the
+  // split-reduction attribute, which changes downstream codegen even though no
+  // actual split happens. Return nullopt so the op is treated as "not split".
+  if (limitParallelLoops <= 1) {
+    LDBG() << "skipping op; limitParallelLoops <= 1 means no split";
+    return std::nullopt;
   }
 
   // Based on the limitParallelLoops, assign tile size. For batch-first layout,
@@ -378,6 +428,14 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
   const int64_t largeOutputSize = 2048 * 4096;
   const int64_t largeKSize = 18000;
   const int64_t ratioThreshold = 48;
+  // Additional "no-split" threshold: when the reduction is tiny (k <
+  // tinyKSize) and the output is small enough that the op can already be
+  // parallelised without splitting the reduction, any split just adds
+  // partial-result reduction overhead. Derived from an all_weight_shapes
+  // matmul sweep -- affected shapes measured 1.69x-1.78x speedup without
+  // split reduction.
+  const int64_t tinyKSize = 5000;
+  const int64_t smallOutputSize = 128 * 128;
 
   // When the output size is large, the workload tends to distributed across
   // many workgroups, making split reduction little to no effect.
@@ -393,24 +451,64 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
     return std::nullopt;
   }
 
+  // Tiny reduction on a small output: splitting adds overhead that the
+  // per-split work can't amortise.
+  if (kSize < tinyKSize && outputSize < smallOutputSize) {
+    LDBG() << "skipping op; tiny reduction on small output";
+    return std::nullopt;
+  }
+
   // Tile sizes are determined based on output (parallel dimension) sizes.
   // For larger outputs, the workload tends to be distributed across more
   // workgroups, thereby reducing the need for extensive splitting along the
   // reduction dimensions.
+  //
+  // The 2D (outputSize, kSize) refinements below were derived from an
+  // all_weight_shapes matmul sweep: within each outputSize band the baseline
+  // over-splits the reduction when kSize is modest, leaving workgroups with
+  // too little compute work to offset the partial-reduction overhead. The
+  // refinements produced 18 wins, 0 losses on the swept dataset, with peak
+  // per-shape gains of 2.24x-2.95x.
   SmallVector<int64_t> tileSizes = std::move(*maybeSizes);
   int64_t limitParallelLoops;
   if (outputSize <= 16 * 16 || kSize > 1e7) {
     limitParallelLoops = 2048;
   } else if (outputSize <= 64 * 64 || kSize > 1e6) {
-    limitParallelLoops = 128;
+    // baseline=128; cut back when reduction is modest
+    if (kSize < 50000) {
+      limitParallelLoops = 32;
+    } else if (kSize < 500000) {
+      limitParallelLoops = 64;
+    } else {
+      limitParallelLoops = 128;
+    }
   } else if (outputSize <= 128 * 128) {
-    limitParallelLoops = 64;
+    // baseline=64; cut back to 16 when reduction is modest
+    if (kSize < 50000) {
+      limitParallelLoops = 16;
+    } else {
+      limitParallelLoops = 64;
+    }
   } else if (outputSize <= 256 * 256) {
-    limitParallelLoops = 32;
+    // baseline=32; cut back to 8 when reduction is modest
+    if (kSize < 50000) {
+      limitParallelLoops = 8;
+    } else {
+      limitParallelLoops = 32;
+    }
   } else if (outputSize <= 512 * 512) {
     limitParallelLoops = 16;
   } else {
     limitParallelLoops = std::min<int64_t>(8, tileSizes[0]);
+  }
+
+  // limitParallelLoops <= 1 means "no splitting" -- the loop below would keep
+  // tileSizes equal to the full reduction dim sizes and still attach the
+  // split-reduction attribute, which changes downstream codegen even though no
+  // actual split happens. Return nullopt so the op is treated as "not split".
+  if (limitParallelLoops <= 1) {
+    LDBG() << "skipping op; limitParallelLoops <= 1 means no split";
+    return std::nullopt;
   }
 
   // Based on the limitParallelLoops, assign tile size from the outermost
