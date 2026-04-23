@@ -276,6 +276,18 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
     limitParallelLoops = 64;
   } else if (outputSize < 512 * 512) {
     limitParallelLoops = 16;
+  } else if (outputSize >= 2 * 1024 * 1024 && reductionSize < 50000) {
+    // Rule (a): huge output with modest reduction -- splitting adds overhead
+    // without payoff. Derived from all_weight_shapes_conv sweep data:
+    // shapes in this regime measured 1.15x-2.20x speedup without any split
+    // reduction (e.g. convfp16 -n 32 -c 256 -H 25 -W 25 -k 2376: 2.20x).
+    LDBG() << "skipping op; huge output with modest reduction";
+    return std::nullopt;
+  } else if (outputSize >= 1024 * 1024 && reductionSize >= 200000) {
+    // Rule (b): large output with huge reduction -- upstream's default of
+    // min(8, startTileSize) under-splits. 16 splits measured 1.13x-1.17x
+    // faster on shapes like -n 10/12 -c 448 ... k 448.
+    limitParallelLoops = 16;
   } else {
     limitParallelLoops = std::min<int64_t>(8, startTileSize);
   }
@@ -408,6 +420,17 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
   } else if (outputSize <= 256 * 256) {
     limitParallelLoops = 32;
   } else if (outputSize <= 512 * 512) {
+    limitParallelLoops = 16;
+  } else if (outputSize >= 2 * 1024 * 1024 && kSize < 50000) {
+    // Rule (a): huge output with modest reduction -- splitting adds overhead
+    // without payoff. Mirrors the conv heuristic's matching rule; matmul
+    // sweep data shows shapes like m=1024 n=2048 K=20000 run 1.66x-1.90x
+    // faster with no split than with upstream's default of 8 splits.
+    LDBG() << "skipping op; huge output with modest reduction";
+    return std::nullopt;
+  } else if (outputSize >= 1024 * 1024 && kSize >= 200000) {
+    // Rule (b): large output with huge reduction -- 16 splits beats 8 on
+    // shapes in this regime (mirrors the conv rule).
     limitParallelLoops = 16;
   } else {
     limitParallelLoops = std::min<int64_t>(8, tileSizes[0]);
