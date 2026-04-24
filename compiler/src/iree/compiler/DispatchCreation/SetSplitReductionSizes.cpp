@@ -286,12 +286,16 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
   } else if (outputSize < 256 * 256) {
     limitParallelLoops = 64;
   } else if (outputSize < 512 * 512) {
-    // Rule (c) [small-GPU / RDNA4]: within the [256^2, 512^2) band,
-    // limit=16 under-splits shapes with large reductions on RDNA4. Sweep
-    // data (RX 9070 XT, oc=56 bs=56 img=9 family, outputSize 112896-225792)
-    // shows limit=32 saves 300-1000us when reductionSize >= 200k, and
-    // limit=64 wins another 500-2000us at reductionSize >= 400k.
-    if (isSmallGpuTarget(gpuWorkgroupParallelism) && reductionSize >= 400000) {
+    // Rule (c): within the [256^2, 512^2) band, limit=16 under-splits shapes
+    // with large reductions. At reductionSize >= 800k both RDNA4 and CDNA4
+    // sweep data agree that limit=64 wins (1.0-1.8ms on oc=56 bs=56 img=9
+    // family), so this branch is arch-invariant. The intermediate tiers
+    // (32 at 200-400k, 64 at 400-800k) only help on RDNA4; CDNA4 prefers
+    // upstream's 16 in those bands, so they stay gated.
+    if (reductionSize >= 800000) {
+      limitParallelLoops = 64;
+    } else if (isSmallGpuTarget(gpuWorkgroupParallelism) &&
+               reductionSize >= 400000) {
       limitParallelLoops = 64;
     } else if (isSmallGpuTarget(gpuWorkgroupParallelism) &&
                reductionSize >= 200000) {
@@ -299,11 +303,12 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
     } else {
       limitParallelLoops = 16;
     }
-  } else if (isSmallGpuTarget(gpuWorkgroupParallelism) &&
-             outputSize >= 2 * 1024 * 1024 && reductionSize < 50000) {
-    // Rule (a) [small-GPU / RDNA4]: huge output with modest reduction --
-    // splitting adds overhead without payoff. Sweep data shows 1.15x-2.20x
-    // speedup with no split (e.g. convfp16 -n 32 -c 256 -H 25 -W 25 -k 2376).
+  } else if (outputSize >= 2 * 1024 * 1024 && reductionSize < 50000) {
+    // Rule (a): huge output with tiny reduction -- splitting adds overhead
+    // without payoff on either arch. RDNA4 sweep: 1.15x-2.20x speedup with
+    // no split (e.g. convfp16 -n 32 -c 256 -H 25 -W 25 -k 2376). CDNA4 sweep
+    // confirms the same trend (e.g. oc=2376 red=20k saves 160us, oc=576
+    // red=24k saves 40us).
     LDBG() << "skipping op; huge output with modest reduction";
     return std::nullopt;
   } else if (isSmallGpuTarget(gpuWorkgroupParallelism) &&
@@ -471,11 +476,11 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
     }
   } else if (outputSize <= 512 * 512) {
     limitParallelLoops = 16;
-  } else if (smallGpu && outputSize >= 2 * 1024 * 1024 && kSize < 50000) {
-    // Rule (a) [small-GPU / RDNA4]: huge output with modest reduction --
-    // splitting adds overhead without payoff. Mirrors the conv rule; matmul
-    // sweep shows m=1024 n=2048 K=20000 runs 1.66x-1.90x faster with no
-    // split than upstream's default of 8 splits.
+  } else if (outputSize >= 2 * 1024 * 1024 && kSize < 50000) {
+    // Rule (a): huge output with tiny reduction -- splitting adds overhead
+    // without payoff on either arch. RDNA4 sweep: m=1024 n=2048 K=20000
+    // runs 1.66x-1.90x faster with no split. CDNA4 sweep confirms the
+    // trend (m=1024/2048 n=2048/1024 k=20000 saves 36-82us on MI355X).
     LDBG() << "skipping op; huge output with modest reduction";
     return std::nullopt;
   } else if (smallGpu && outputSize >= 1024 * 1024 && kSize >= 200000) {
@@ -486,13 +491,16 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
              outputSize < 1500000 && kSize < 100000) {
     // Rule (d) [small-GPU / RDNA4]: narrow window of output ~1-1.5M with
     // modest K -- splitting costs more than it saves. Sweep: m=1024 n=1024
-    // k=80000 runs 1.16x faster with no split.
+    // k=80000 runs 1.16x faster with no split on RX 9070 XT. CDNA4 prefers
+    // 8 here (loses ~90us), so this stays gated.
     LDBG() << "skipping op; narrow output window with modest K";
     return std::nullopt;
-  } else if (smallGpu && outputSize <= 800000 && kSize >= 100000) {
-    // Rule (e) [small-GPU / RDNA4]: mid-output (<=~800k) with moderate-or-
-    // bigger K benefits from 16 splits over upstream's min(8,...). Sweep:
-    // m=448 n=896 k=107k-150k runs 1.11x-1.12x faster at limit=16.
+  } else if (outputSize <= 800000 && kSize >= 100000) {
+    // Rule (e): mid-output (<=~800k) with moderate-or-bigger K benefits
+    // from 16 splits over upstream's min(8,...). RDNA4 sweep: m=448 n=896
+    // k=107k-150k runs 1.11x-1.12x faster. CDNA4 sweep: same family at
+    // k=214k-257k runs 2.5x-2.9x faster (saves 912us and 873us on MI355X),
+    // so this is promoted to unconditional.
     limitParallelLoops = 16;
   } else {
     limitParallelLoops = std::min<int64_t>(8, tileSizes[0]);
