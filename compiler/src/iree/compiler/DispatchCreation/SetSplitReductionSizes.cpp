@@ -279,10 +279,30 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
   int64_t startTileSize =
       isBatchFirstLayout ? tileSizes.back() : tileSizes.front();
   int64_t limitParallelLoops;
+  const bool smallGpu = isSmallGpuTarget(gpuWorkgroupParallelism);
   if (outputSize < 32 * 32) {
     limitParallelLoops = 2048;
   } else if (outputSize < 128 * 128) {
     limitParallelLoops = 128;
+  } else if (smallGpu && outputSize < 256 * 256 &&
+             outputChannelSize * imageSize * depthSize < 1500 &&
+             reductionSize >= 8192 && reductionSize < 50000) {
+    // Rule (f) [small-GPU / RDNA4]: small output with narrow per-batch
+    // parallelism (outputChannel * spatial filter dims) and modest
+    // reduction. Upstream's 64 over-splits in this regime on RDNA4;
+    // sweep data shows 1.5x-1.7x speedup at limit=8 for weight-gradient
+    // convs (e.g. oc=96 bs=96 img=3 red=24576 runs 54us vs upstream's
+    // 64-split 90us). Uses outputChannel * imageSize * depthSize instead
+    // of the LUT parallelSize (which uses batchSize for non-batch-first
+    // layouts like backward-weight) to catch the narrow filter-spatial
+    // pattern. CDNA4 preferences are mixed on the same shapes, so gated.
+    limitParallelLoops = 8;
+  } else if (smallGpu && outputSize < 256 * 256 &&
+             outputChannelSize * imageSize * depthSize < 1500 &&
+             reductionSize >= 50000 && reductionSize < 300000) {
+    // Rule (g) [small-GPU / RDNA4]: same pattern with bigger reduction --
+    // sweep data shows limit=16-32 is best; use 16 as a reasonable middle.
+    limitParallelLoops = 16;
   } else if (outputSize < 256 * 256) {
     limitParallelLoops = 64;
   } else if (outputSize < 512 * 512) {
@@ -462,6 +482,18 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
     // Small-GPU: moderate output with massive K keeps upstream's 128
     // (e.g. m=32 n=224 k>=3M measured fastest at 128 on RX 9070 XT).
     limitParallelLoops = 128;
+  } else if (smallGpu && outputSize > 64 * 64 && outputSize <= 256 * 256 &&
+             std::min(mSize, nSize) >= 64 && kSize >= 18000 &&
+             kSize < 150000) {
+    // Rule (f) matmul [small-GPU / RDNA4]: chunky (non-skinny) moderate-
+    // output shapes with mid-range K. Upstream's 32/64 over-splits on RDNA4.
+    // Sweep data: m=128 n=128 k=32768 runs 1.6x faster at limit=8 (32us vs
+    // 52us); m=128 n=512 k=18928/32768 runs 1.6x faster at limit=8 (61-82us
+    // vs 90-125us). Narrowed to min(m,n) >= 64 and k < 150k to exclude
+    // skinny or large-K families (e.g. m=32 n=224 k=681500) that prefer
+    // upstream's 64/128. CDNA4 often prefers upstream's 64 on these so
+    // keep gated.
+    limitParallelLoops = 8;
   } else if (outputSize <= 128 * 128) {
     limitParallelLoops = 64;
   } else if (outputSize <= 256 * 256) {
