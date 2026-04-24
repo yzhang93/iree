@@ -275,7 +275,17 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
   } else if (outputSize < 256 * 256) {
     limitParallelLoops = 64;
   } else if (outputSize < 512 * 512) {
-    limitParallelLoops = 16;
+    // Rule (c): within the [256^2, 512^2) band, limit=16 under-splits shapes
+    // with large reductions. Sweep data (oc=56 bs=56 img=9 family, outputSize
+    // 112896-225792) shows limit=32 saves 300-1000us when reductionSize
+    // >= 200k, and limit=64 wins another 500-2000us at reductionSize >= 400k.
+    if (reductionSize >= 400000) {
+      limitParallelLoops = 64;
+    } else if (reductionSize >= 200000) {
+      limitParallelLoops = 32;
+    } else {
+      limitParallelLoops = 16;
+    }
   } else if (outputSize >= 2 * 1024 * 1024 && reductionSize < 50000) {
     // Rule (a): huge output with modest reduction -- splitting adds overhead
     // without payoff. Derived from all_weight_shapes_conv sweep data:
@@ -287,6 +297,14 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
     // Rule (b): large output with huge reduction -- upstream's default of
     // min(8, startTileSize) under-splits. 16 splits measured 1.13x-1.17x
     // faster on shapes like -n 10/12 -c 448 ... k 448.
+    limitParallelLoops = 16;
+  } else if (outputSize < 1500000 && reductionSize >= 50000 &&
+             parallelSize < 1000) {
+    // Rule (d): narrow parallel shapes (small oc*image, e.g. oc=56 img=9)
+    // with moderate reduction benefit from 16 splits. Upstream's
+    // min(8, startTileSize) under-splits when the parallel dim is too small
+    // to fill the GPU. Sweep data: out=451584 red=53690 oc=56 bs=56 img=9
+    // measured 1.19x-1.41x speedup at limit=16 vs upstream's 8.
     limitParallelLoops = 16;
   } else {
     limitParallelLoops = std::min<int64_t>(8, startTileSize);
@@ -413,12 +431,23 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
   int64_t limitParallelLoops;
   if (outputSize <= 16 * 16 || kSize > 1e7) {
     limitParallelLoops = 2048;
-  } else if (outputSize <= 64 * 64 || kSize > 1e6) {
+  } else if (outputSize <= 64 * 64) {
+    limitParallelLoops = 128;
+  } else if (outputSize <= 128 * 128 && kSize > 1e6) {
+    // Moderate output with massive K: upstream's 128 splits still works best
+    // here (e.g. m=32 n=224 k>=3M measured fastest at 128).
     limitParallelLoops = 128;
   } else if (outputSize <= 128 * 128) {
     limitParallelLoops = 64;
   } else if (outputSize <= 256 * 256) {
-    limitParallelLoops = 32;
+    // Rule (c): moderate output (up to 256^2) with huge K -- 128 splits is
+    // too aggressive. Sweep data: m=256 n=256 k=1280000 runs 1.76x faster at
+    // limit=8 vs 128; m=224 n=448 k=1023660 runs 1.18x faster at limit=16.
+    if (kSize > 1e6) {
+      limitParallelLoops = 8;
+    } else {
+      limitParallelLoops = 32;
+    }
   } else if (outputSize <= 512 * 512) {
     limitParallelLoops = 16;
   } else if (outputSize >= 2 * 1024 * 1024 && kSize < 50000) {
@@ -431,6 +460,18 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
   } else if (outputSize >= 1024 * 1024 && kSize >= 200000) {
     // Rule (b): large output with huge reduction -- 16 splits beats 8 on
     // shapes in this regime (mirrors the conv rule).
+    limitParallelLoops = 16;
+  } else if (outputSize >= 1024 * 1024 && outputSize < 1500000 &&
+             kSize < 100000) {
+    // Rule (d): narrow window of output ~1-1.5M with modest K -- splitting
+    // costs more than it saves. Sweep data: m=1024 n=1024 k=80000 runs
+    // 1.16x faster with no split.
+    LDBG() << "skipping op; narrow output window with modest K";
+    return std::nullopt;
+  } else if (outputSize <= 800000 && kSize >= 100000) {
+    // Rule (e): mid-output (<=~800k) with moderate-or-bigger K benefits from
+    // 16 splits over upstream's min(8,...). Sweep data: m=448 n=896 k=107k-
+    // 150k runs 1.11x-1.12x faster at limit=16.
     limitParallelLoops = 16;
   } else {
     limitParallelLoops = std::min<int64_t>(8, tileSizes[0]);
