@@ -135,9 +135,20 @@ getOuterReductionSizes(PartialReductionOpInterface op,
 /// structure to find reduction dimensions that can be split to improve
 /// parallelism. Splitting can be applied across multiple reduction dimensions,
 /// with tile sizes varying according to the output (parallel dimension) sizes.
+// GPU-class threshold used to decide whether to apply the small-GPU (RDNA4-
+// tuned) rules. Targets with fewer concurrent workgroups than this value (at
+// which point the default LUT, calibrated on CDNA4 / MI355X, picks LUT values
+// that can be off by ~4x for many shapes) switch to the small-GPU path.
+constexpr int64_t kSmallGpuParallelismThreshold = 4096;
+static inline bool isSmallGpuTarget(int64_t gpuWorkgroupParallelism) {
+  return gpuWorkgroupParallelism > 0 &&
+         gpuWorkgroupParallelism < kSmallGpuParallelismThreshold;
+}
+
 static std::optional<SmallVector<int64_t>>
 getConvolutionReductionSizes(PartialReductionOpInterface op,
-                             int64_t splitReductionTargetSize) {
+                             int64_t splitReductionTargetSize,
+                             int64_t gpuWorkgroupParallelism) {
   // First check if the input op is a convolution with static shapes.
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op.getOperation());
   if (!linalgOp || !linalg::isaConvolutionOpInterface(linalgOp)) {
@@ -275,36 +286,40 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
   } else if (outputSize < 256 * 256) {
     limitParallelLoops = 64;
   } else if (outputSize < 512 * 512) {
-    // Rule (c): within the [256^2, 512^2) band, limit=16 under-splits shapes
-    // with large reductions. Sweep data (oc=56 bs=56 img=9 family, outputSize
-    // 112896-225792) shows limit=32 saves 300-1000us when reductionSize
-    // >= 200k, and limit=64 wins another 500-2000us at reductionSize >= 400k.
-    if (reductionSize >= 400000) {
+    // Rule (c) [small-GPU / RDNA4]: within the [256^2, 512^2) band,
+    // limit=16 under-splits shapes with large reductions on RDNA4. Sweep
+    // data (RX 9070 XT, oc=56 bs=56 img=9 family, outputSize 112896-225792)
+    // shows limit=32 saves 300-1000us when reductionSize >= 200k, and
+    // limit=64 wins another 500-2000us at reductionSize >= 400k.
+    if (isSmallGpuTarget(gpuWorkgroupParallelism) && reductionSize >= 400000) {
       limitParallelLoops = 64;
-    } else if (reductionSize >= 200000) {
+    } else if (isSmallGpuTarget(gpuWorkgroupParallelism) &&
+               reductionSize >= 200000) {
       limitParallelLoops = 32;
     } else {
       limitParallelLoops = 16;
     }
-  } else if (outputSize >= 2 * 1024 * 1024 && reductionSize < 50000) {
-    // Rule (a): huge output with modest reduction -- splitting adds overhead
-    // without payoff. Derived from all_weight_shapes_conv sweep data:
-    // shapes in this regime measured 1.15x-2.20x speedup without any split
-    // reduction (e.g. convfp16 -n 32 -c 256 -H 25 -W 25 -k 2376: 2.20x).
+  } else if (isSmallGpuTarget(gpuWorkgroupParallelism) &&
+             outputSize >= 2 * 1024 * 1024 && reductionSize < 50000) {
+    // Rule (a) [small-GPU / RDNA4]: huge output with modest reduction --
+    // splitting adds overhead without payoff. Sweep data shows 1.15x-2.20x
+    // speedup with no split (e.g. convfp16 -n 32 -c 256 -H 25 -W 25 -k 2376).
     LDBG() << "skipping op; huge output with modest reduction";
     return std::nullopt;
-  } else if (outputSize >= 1024 * 1024 && reductionSize >= 200000) {
-    // Rule (b): large output with huge reduction -- upstream's default of
-    // min(8, startTileSize) under-splits. 16 splits measured 1.13x-1.17x
-    // faster on shapes like -n 10/12 -c 448 ... k 448.
+  } else if (isSmallGpuTarget(gpuWorkgroupParallelism) &&
+             outputSize >= 1024 * 1024 && reductionSize >= 200000) {
+    // Rule (b) [small-GPU / RDNA4]: large output with huge reduction --
+    // upstream's default of min(8, startTileSize) under-splits. 16 splits
+    // measured 1.13x-1.17x faster on shapes like -n 10/12 -c 448 ... k 448.
     limitParallelLoops = 16;
-  } else if (outputSize < 1500000 && reductionSize >= 50000 &&
+  } else if (isSmallGpuTarget(gpuWorkgroupParallelism) &&
+             outputSize < 1500000 && reductionSize >= 50000 &&
              parallelSize < 1000) {
-    // Rule (d): narrow parallel shapes (small oc*image, e.g. oc=56 img=9)
-    // with moderate reduction benefit from 16 splits. Upstream's
-    // min(8, startTileSize) under-splits when the parallel dim is too small
-    // to fill the GPU. Sweep data: out=451584 red=53690 oc=56 bs=56 img=9
-    // measured 1.19x-1.41x speedup at limit=16 vs upstream's 8.
+    // Rule (d) [small-GPU / RDNA4]: narrow parallel shapes (small oc*image,
+    // e.g. oc=56 img=9) with moderate reduction benefit from 16 splits.
+    // Upstream's min(8, startTileSize) under-splits when parallel dim is
+    // too small to fill the GPU. Sweep data: out=451584 red=53690 oc=56
+    // bs=56 img=9 measured 1.19x-1.41x speedup at limit=16 vs upstream's 8.
     limitParallelLoops = 16;
   } else {
     limitParallelLoops = std::min<int64_t>(8, startTileSize);
@@ -343,7 +358,8 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
 /// generalize to all cases.
 static std::optional<SmallVector<int64_t>>
 getMatmulLikeReductionSizes(PartialReductionOpInterface op,
-                            int64_t splitReductionTargetSize) {
+                            int64_t splitReductionTargetSize,
+                            int64_t gpuWorkgroupParallelism) {
   // Matmul-like op should have at least 1 reduction, which is checked by the
   // contraction interface, and at least 2 parallel dimensions.
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op.getOperation());
@@ -429,49 +445,54 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
   // reduction dimensions.
   SmallVector<int64_t> tileSizes = std::move(*maybeSizes);
   int64_t limitParallelLoops;
+  const bool smallGpu = isSmallGpuTarget(gpuWorkgroupParallelism);
   if (outputSize <= 16 * 16 || kSize > 1e7) {
     limitParallelLoops = 2048;
-  } else if (outputSize <= 64 * 64) {
+  } else if (!smallGpu && (outputSize <= 64 * 64 || kSize > 1e6)) {
+    // Upstream (CDNA-class) LUT: lump "tiny output OR huge K" into 128.
     limitParallelLoops = 128;
-  } else if (outputSize <= 128 * 128 && kSize > 1e6) {
-    // Moderate output with massive K: upstream's 128 splits still works best
-    // here (e.g. m=32 n=224 k>=3M measured fastest at 128).
+  } else if (smallGpu && outputSize <= 64 * 64) {
+    limitParallelLoops = 128;
+  } else if (smallGpu && outputSize <= 128 * 128 && kSize > 1e6) {
+    // Small-GPU: moderate output with massive K keeps upstream's 128
+    // (e.g. m=32 n=224 k>=3M measured fastest at 128 on RX 9070 XT).
     limitParallelLoops = 128;
   } else if (outputSize <= 128 * 128) {
     limitParallelLoops = 64;
   } else if (outputSize <= 256 * 256) {
-    // Rule (c): moderate output (up to 256^2) with huge K -- 128 splits is
-    // too aggressive. Sweep data: m=256 n=256 k=1280000 runs 1.76x faster at
-    // limit=8 vs 128; m=224 n=448 k=1023660 runs 1.18x faster at limit=16.
-    if (kSize > 1e6) {
+    // Rule (c) [small-GPU / RDNA4]: moderate output (up to 256^2) with huge
+    // K -- 128 splits is too aggressive. Sweep: m=256 n=256 k=1280000 runs
+    // 1.76x faster at limit=8 vs 128; m=224 n=448 k=1023660 runs 1.18x
+    // faster at limit=16.
+    if (smallGpu && kSize > 1e6) {
       limitParallelLoops = 8;
     } else {
       limitParallelLoops = 32;
     }
   } else if (outputSize <= 512 * 512) {
     limitParallelLoops = 16;
-  } else if (outputSize >= 2 * 1024 * 1024 && kSize < 50000) {
-    // Rule (a): huge output with modest reduction -- splitting adds overhead
-    // without payoff. Mirrors the conv heuristic's matching rule; matmul
-    // sweep data shows shapes like m=1024 n=2048 K=20000 run 1.66x-1.90x
-    // faster with no split than with upstream's default of 8 splits.
+  } else if (smallGpu && outputSize >= 2 * 1024 * 1024 && kSize < 50000) {
+    // Rule (a) [small-GPU / RDNA4]: huge output with modest reduction --
+    // splitting adds overhead without payoff. Mirrors the conv rule; matmul
+    // sweep shows m=1024 n=2048 K=20000 runs 1.66x-1.90x faster with no
+    // split than upstream's default of 8 splits.
     LDBG() << "skipping op; huge output with modest reduction";
     return std::nullopt;
-  } else if (outputSize >= 1024 * 1024 && kSize >= 200000) {
-    // Rule (b): large output with huge reduction -- 16 splits beats 8 on
-    // shapes in this regime (mirrors the conv rule).
+  } else if (smallGpu && outputSize >= 1024 * 1024 && kSize >= 200000) {
+    // Rule (b) [small-GPU / RDNA4]: large output with huge reduction -- 16
+    // splits beats 8 on shapes in this regime (mirrors the conv rule).
     limitParallelLoops = 16;
-  } else if (outputSize >= 1024 * 1024 && outputSize < 1500000 &&
-             kSize < 100000) {
-    // Rule (d): narrow window of output ~1-1.5M with modest K -- splitting
-    // costs more than it saves. Sweep data: m=1024 n=1024 k=80000 runs
-    // 1.16x faster with no split.
+  } else if (smallGpu && outputSize >= 1024 * 1024 &&
+             outputSize < 1500000 && kSize < 100000) {
+    // Rule (d) [small-GPU / RDNA4]: narrow window of output ~1-1.5M with
+    // modest K -- splitting costs more than it saves. Sweep: m=1024 n=1024
+    // k=80000 runs 1.16x faster with no split.
     LDBG() << "skipping op; narrow output window with modest K";
     return std::nullopt;
-  } else if (outputSize <= 800000 && kSize >= 100000) {
-    // Rule (e): mid-output (<=~800k) with moderate-or-bigger K benefits from
-    // 16 splits over upstream's min(8,...). Sweep data: m=448 n=896 k=107k-
-    // 150k runs 1.11x-1.12x faster at limit=16.
+  } else if (smallGpu && outputSize <= 800000 && kSize >= 100000) {
+    // Rule (e) [small-GPU / RDNA4]: mid-output (<=~800k) with moderate-or-
+    // bigger K benefits from 16 splits over upstream's min(8,...). Sweep:
+    // m=448 n=896 k=107k-150k runs 1.11x-1.12x faster at limit=16.
     limitParallelLoops = 16;
   } else {
     limitParallelLoops = std::min<int64_t>(8, tileSizes[0]);
@@ -559,14 +580,14 @@ struct SetSplitReductionSizesPass final
 
       // --- Case 2: Generic convolution ---
       if (auto tileSizes = getConvolutionReductionSizes(
-              tilingOp, splitReductionTargetSize)) {
+              tilingOp, splitReductionTargetSize, gpuWorkgroupParallelism)) {
         IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
         return;
       }
 
       // --- Case 3: Matmul-like operations ---
-      if (auto tileSizes =
-              getMatmulLikeReductionSizes(tilingOp, splitReductionTargetSize)) {
+      if (auto tileSizes = getMatmulLikeReductionSizes(
+              tilingOp, splitReductionTargetSize, gpuWorkgroupParallelism)) {
         IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
         return;
       }

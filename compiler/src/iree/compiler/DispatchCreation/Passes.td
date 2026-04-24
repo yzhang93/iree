@@ -338,7 +338,15 @@ def SetSplitReductionSizesPass :
     Option<"splitReductionTargetSize", "split-reduction-target-size", "int64_t", "1024",
            "Target tile size for split reduction. Inner reduction "
            "dimensions are tiled first, with the tile size rounded "
-           "up until it evenly divides the iteration domain.">
+           "up until it evenly divides the iteration domain.">,
+    Option<"gpuWorkgroupParallelism", "gpu-workgroup-parallelism",
+           "int64_t", "8192",
+           "Approximate number of workgroups the target GPU can run "
+           "concurrently (~ #CUs x active-waves-per-CU). Calibrated for "
+           "large-GPU CDNA-class targets at 8192; RDNA-class targets (e.g. "
+           "RX 9070 XT, ~64 CUs) should pass ~2048 to enable the small-GPU "
+           "tuned rules in getConvolutionReductionSizes and "
+           "getMatmulLikeReductionSizes.">
   ];
   let dependentDialects = [];
 }

@@ -80,6 +80,17 @@ struct TransformOptions : PassPipelineOptions<TransformOptions> {
       llvm::cl::desc("Enable split reduction for dispatch creation pipeline"),
       llvm::cl::init(false),
   };
+  Option<int64_t> splitReductionGpuWorkgroupParallelism{
+      *this,
+      "split-reduction-gpu-workgroup-parallelism",
+      llvm::cl::desc(
+          "Approximate number of workgroups the target GPU can run "
+          "concurrently, used to select between large-GPU (CDNA-class, "
+          "upstream LUT) and small-GPU (RDNA-class, tuned rules) paths in "
+          "the split reduction size heuristic. 8192 matches MI355X; pass "
+          "~2048 for RX 9070 XT / RDNA4."),
+      llvm::cl::init(8192),
+  };
   Option<bool> enableAggressiveReshapeMovement{
       *this,
       "aggressive-reshape-movement",

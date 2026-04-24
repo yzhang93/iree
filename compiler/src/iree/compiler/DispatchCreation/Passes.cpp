@@ -178,8 +178,12 @@ static void addDispatchRegionCreationPreprocessingPasses(
       //        - Legacy pass to be deprecated
       .addPass(DispatchCreation::createSplitReductionPass)
       //        - Split reduction using partial reduction tiling.
-      .addPredicatedPass(dispatchOptions.enableSplitReduction,
-                         DispatchCreation::createSetSplitReductionSizesPass)
+      .addPredicatedPass(dispatchOptions.enableSplitReduction, [&]() {
+        SetSplitReductionSizesPassOptions options;
+        options.gpuWorkgroupParallelism =
+            dispatchOptions.splitReductionGpuWorkgroupParallelism;
+        return DispatchCreation::createSetSplitReductionSizesPass(options);
+      })
       .addPass([&]() {
         FormSplitReductionDispatchesPassOptions options;
         options.enableFusePad =

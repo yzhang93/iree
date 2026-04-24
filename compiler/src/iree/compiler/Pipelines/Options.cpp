@@ -402,6 +402,15 @@ void DispatchCreationOptions::bindOptions(OptionsBinder &binder) {
       llvm::cl::desc(
           "Enable split-reduction for certain reduction operations."),
       llvm::cl::cat(category));
+  binder.opt<int64_t>(
+      "iree-dispatch-creation-split-reduction-gpu-workgroup-parallelism",
+      splitReductionGpuWorkgroupParallelism,
+      llvm::cl::desc(
+          "Approximate concurrent workgroup budget for the target GPU used "
+          "by the split-reduction size heuristic. Default 8192 is calibrated "
+          "for CDNA-class targets (e.g. MI355X); pass ~2048 for RDNA-class "
+          "targets (e.g. RX 9070 XT) to enable the small-GPU tuned rules."),
+      llvm::cl::cat(category));
   binder.opt<bool>(
       "iree-dispatch-creation-enable-aggressive-reshape-movement",
       enableAggressiveReshapeMovement,

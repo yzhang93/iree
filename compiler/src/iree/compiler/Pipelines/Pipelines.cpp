@@ -359,6 +359,8 @@ void buildIREEVMTransformPassPipeline(
     }
     dispatchTransformOptions.enableSplitReduction =
         dispatchCreationOptions.enableSplitReduction;
+    dispatchTransformOptions.splitReductionGpuWorkgroupParallelism =
+        dispatchCreationOptions.splitReductionGpuWorkgroupParallelism;
     dispatchTransformOptions.enableAggressiveReshapeMovement =
         dispatchCreationOptions.enableAggressiveReshapeMovement;
     dispatchTransformOptions.enablePadHandling =

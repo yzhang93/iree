@@ -270,6 +270,11 @@ struct DispatchCreationOptions {
   bool enableAggressiveFusion = false;
   bool enableFuseMultiUse = true;
   bool enableSplitReduction = false;
+  // Approximate concurrent workgroup budget for the target GPU (roughly
+  // #CUs * active-waves-per-CU). Default 8192 matches CDNA-class targets
+  // (e.g. MI355X). RDNA-class targets (e.g. RX 9070 XT, ~64 CUs) should
+  // use ~2048 to enable the small-GPU tuned split reduction rules.
+  int64_t splitReductionGpuWorkgroupParallelism = 8192;
 
   // Enables data tiling in dispatch creation phase.
   bool dataTiling = false;
