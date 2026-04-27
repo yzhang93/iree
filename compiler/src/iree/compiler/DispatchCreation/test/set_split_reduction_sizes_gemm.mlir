@@ -1,4 +1,5 @@
 // RUN: iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-set-split-reduction-sizes))" --split-input-file %s | FileCheck %s
+// RUN: iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-set-split-reduction-sizes{small-gpu=true}))" --split-input-file %s | FileCheck %s --check-prefix=RDNA
 
 #map = affine_map<(d0, d1, d2) -> (d0, d2)>
 #map1 = affine_map<(d0, d1, d2) -> (d2, d1)>
@@ -15,6 +16,18 @@ util.func public @split_matmul(%arg0: tensor<32x40960xf32>, %arg1: tensor<40960x
 
 // CHECK-LABEL: @split_matmul
 //       CHECK: iree_linalg_ext.split_reduction = [320 : index]
+
+// -----
+
+util.func public @split_balanced_matmul_small_gpu(%arg0: tensor<128x32768xbf16>, %arg1: tensor<32768x128xbf16>, %arg2: tensor<128x128xf32>) -> tensor<128x128xf32> {
+  %0 = linalg.matmul ins(%arg0, %arg1 : tensor<128x32768xbf16>, tensor<32768x128xbf16>) outs(%arg2 : tensor<128x128xf32>) -> tensor<128x128xf32>
+  util.return %0 : tensor<128x128xf32>
+}
+
+// CHECK-LABEL: @split_balanced_matmul_small_gpu
+//       CHECK: iree_linalg_ext.split_reduction = [512 : index]
+// RDNA-LABEL: @split_balanced_matmul_small_gpu
+//       RDNA: iree_linalg_ext.split_reduction = [4096 : index]
 
 // -----
 

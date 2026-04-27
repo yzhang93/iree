@@ -135,9 +135,42 @@ getOuterReductionSizes(PartialReductionOpInterface op,
 /// structure to find reduction dimensions that can be split to improve
 /// parallelism. Splitting can be applied across multiple reduction dimensions,
 /// with tile sizes varying according to the output (parallel dimension) sizes.
+static std::optional<int64_t>
+getConvolutionLimitParallelLoops(int64_t outputSize, int64_t reductionSize,
+                                 int64_t startTileSize, bool smallGpu) {
+  if (outputSize < 32 * 32) {
+    return 2048;
+  }
+  if (outputSize < 128 * 128) {
+    return 128;
+  }
+  if (outputSize < 256 * 256) {
+    if (reductionSize < 50000) {
+      return smallGpu ? 8 : 64;
+    }
+    return smallGpu ? 16 : 64;
+  }
+  if (outputSize < 512 * 512) {
+    if (reductionSize >= 400000) {
+      return smallGpu ? 64 : 16;
+    }
+    if (reductionSize >= 200000) {
+      return smallGpu ? 32 : 16;
+    }
+    return 16;
+  }
+  // outputSize >= 512 * 512.
+  if (outputSize >= 1024 * 1024) {
+    if (smallGpu && reductionSize >= 200000) {
+      return 16;
+    }
+  }
+  return std::min<int64_t>(8, startTileSize);
+}
+
 static std::optional<SmallVector<int64_t>>
 getConvolutionReductionSizes(PartialReductionOpInterface op,
-                             int64_t splitReductionTargetSize) {
+                             int64_t splitReductionTargetSize, bool smallGpu) {
   // First check if the input op is a convolution with static shapes.
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op.getOperation());
   if (!linalgOp || !linalg::isaConvolutionOpInterface(linalgOp)) {
@@ -260,25 +293,26 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
     return std::nullopt;
   }
 
+  // Skip: small-GPU shapes with huge output and modest reduction.
+  int64_t outputSize = outputChannelSize * batchSize * imageSize * depthSize;
+  if (smallGpu && outputSize >= 2 * 1024 * 1024 && reductionSize < 50000) {
+    LDBG() << "skipping op; huge output with modest reduction";
+    return std::nullopt;
+  }
+
   // Tile sizes are determined based on output (parallel dimension) sizes.
   // For larger outputs, the workload tends to be distributed across more
   // workgroups, thereby reducing the need for extensive splitting along the
   // reduction dimensions.
-  int64_t outputSize = outputChannelSize * batchSize * imageSize * depthSize;
   int64_t startTileSize =
       isBatchFirstLayout ? tileSizes.back() : tileSizes.front();
-  int64_t limitParallelLoops;
-  if (outputSize < 32 * 32) {
-    limitParallelLoops = 2048;
-  } else if (outputSize < 128 * 128) {
-    limitParallelLoops = 128;
-  } else if (outputSize < 256 * 256) {
-    limitParallelLoops = 64;
-  } else if (outputSize < 512 * 512) {
-    limitParallelLoops = 16;
-  } else {
-    limitParallelLoops = std::min<int64_t>(8, startTileSize);
+  std::optional<int64_t> maybeLimitParallelLoops =
+      getConvolutionLimitParallelLoops(outputSize, reductionSize, startTileSize,
+                                       smallGpu);
+  if (!maybeLimitParallelLoops) {
+    return std::nullopt;
   }
+  int64_t limitParallelLoops = maybeLimitParallelLoops.value();
 
   // Based on the limitParallelLoops, assign tile size. For batch-first layout,
   // go from the innermost dimension to the outermost; otherwise, go from the
@@ -311,9 +345,55 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
 /// varying according to the output (parallel dimension) sizes. Note that the
 /// constant thresholds are empirically derived from limited data and may not
 /// generalize to all cases.
+static std::optional<int64_t> getMatmulLimitParallelLoops(int64_t outputSize,
+                                                          int64_t kSize,
+                                                          int64_t startTileSize,
+                                                          bool smallGpu) {
+  // Tiny output or huge K: saturate the budget.
+  if (outputSize <= 16 * 16 || kSize > 1e7) {
+    return 2048;
+  }
+  if (outputSize <= 64 * 64) {
+    return 128;
+  }
+  // Large K: keep the upstream 128 budget; small-GPU prefers a smaller
+  // budget once the output is wide enough to spread the splits.
+  if (kSize > 1e6) {
+    if (outputSize <= 128 * 128) {
+      return 128;
+    }
+    return smallGpu ? 8 : 128;
+  }
+  // kSize <= 1e6.
+  if (outputSize <= 128 * 128) {
+    if (kSize < 150000) {
+      return smallGpu ? 8 : 64;
+    }
+    return 64;
+  }
+  if (outputSize <= 256 * 256) {
+    if (kSize < 150000) {
+      return smallGpu ? 8 : 32;
+    }
+    return 32;
+  }
+  if (outputSize <= 512 * 512) {
+    return 16;
+  }
+  // Mid output with moderate reduction benefits from 16 splits over the
+  // upstream default of min(8, ...).
+  if (outputSize <= 800000 && kSize >= 100000) {
+    return 16;
+  }
+  if (outputSize >= 1024 * 1024 && smallGpu && kSize >= 200000) {
+    return 16;
+  }
+  return std::min<int64_t>(8, startTileSize);
+}
+
 static std::optional<SmallVector<int64_t>>
 getMatmulLikeReductionSizes(PartialReductionOpInterface op,
-                            int64_t splitReductionTargetSize) {
+                            int64_t splitReductionTargetSize, bool smallGpu) {
   // Matmul-like op should have at least 1 reduction, which is checked by the
   // contraction interface, and at least 2 parallel dimensions.
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op.getOperation());
@@ -393,25 +473,30 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
     return std::nullopt;
   }
 
+  // Skip: huge output with modest reduction -- splitting just adds overhead.
+  if (outputSize > 2 * 1024 * 1024 && kSize < 50000) {
+    LDBG() << "skipping op; huge output with modest reduction";
+    return std::nullopt;
+  }
+  // Skip [small-GPU only]: narrow window of output 1M-1.5M with modest K --
+  // splitting costs more than it saves on RDNA-class targets.
+  if (smallGpu && outputSize >= 1024 * 1024 && outputSize < 1500000 &&
+      kSize < 100000) {
+    LDBG() << "skipping op; narrow output window with modest reduction";
+    return std::nullopt;
+  }
+
   // Tile sizes are determined based on output (parallel dimension) sizes.
   // For larger outputs, the workload tends to be distributed across more
   // workgroups, thereby reducing the need for extensive splitting along the
   // reduction dimensions.
   SmallVector<int64_t> tileSizes = std::move(*maybeSizes);
-  int64_t limitParallelLoops;
-  if (outputSize <= 16 * 16 || kSize > 1e7) {
-    limitParallelLoops = 2048;
-  } else if (outputSize <= 64 * 64 || kSize > 1e6) {
-    limitParallelLoops = 128;
-  } else if (outputSize <= 128 * 128) {
-    limitParallelLoops = 64;
-  } else if (outputSize <= 256 * 256) {
-    limitParallelLoops = 32;
-  } else if (outputSize <= 512 * 512) {
-    limitParallelLoops = 16;
-  } else {
-    limitParallelLoops = std::min<int64_t>(8, tileSizes[0]);
+  std::optional<int64_t> maybeLimitParallelLoops =
+      getMatmulLimitParallelLoops(outputSize, kSize, tileSizes[0], smallGpu);
+  if (!maybeLimitParallelLoops) {
+    return std::nullopt;
   }
+  int64_t limitParallelLoops = maybeLimitParallelLoops.value();
 
   // Based on the limitParallelLoops, assign tile size from the outermost
   // dimension to the innermost.
@@ -495,14 +580,14 @@ struct SetSplitReductionSizesPass final
 
       // --- Case 2: Generic convolution ---
       if (auto tileSizes = getConvolutionReductionSizes(
-              tilingOp, splitReductionTargetSize)) {
+              tilingOp, splitReductionTargetSize, smallGpu)) {
         IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
         return;
       }
 
       // --- Case 3: Matmul-like operations ---
-      if (auto tileSizes =
-              getMatmulLikeReductionSizes(tilingOp, splitReductionTargetSize)) {
+      if (auto tileSizes = getMatmulLikeReductionSizes(
+              tilingOp, splitReductionTargetSize, smallGpu)) {
         IREE::LinalgExt::setSplitReductionAttribute(tilingOp, *tileSizes);
         return;
       }

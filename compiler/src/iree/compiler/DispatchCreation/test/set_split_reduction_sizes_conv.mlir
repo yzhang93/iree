@@ -1,4 +1,5 @@
 // RUN: iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-set-split-reduction-sizes))" --split-input-file %s | FileCheck %s
+// RUN: iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-set-split-reduction-sizes{small-gpu=true}))" --split-input-file %s | FileCheck %s --check-prefix=RDNA
 
 #map = affine_map<(d0, d1, d2, d3, d4, d5) -> (d3, d1 + d4, d5, d2)>
 #map1 = affine_map<(d0, d1, d2, d3, d4, d5) -> (d3, d4, d5, d0)>
@@ -17,6 +18,8 @@ module {
 
 // CHECK-LABEL: @conv_1d_chn_chf
 //       CHECK: iree_linalg_ext.split_reduction = [1 : index, 12 : index, 32 : index]
+// RDNA-LABEL: @conv_1d_chn_chf
+//       RDNA: iree_linalg_ext.split_reduction = [2 : index, 48 : index, 32 : index]
 
 // -----
 

@@ -80,6 +80,13 @@ struct TransformOptions : PassPipelineOptions<TransformOptions> {
       llvm::cl::desc("Enable split reduction for dispatch creation pipeline"),
       llvm::cl::init(false),
   };
+  Option<bool> splitReductionSmallGpu{
+      *this,
+      "split-reduction-small-gpu",
+      llvm::cl::desc("Use the small-GPU split-reduction parameter set "
+                     "(RDNA-class targets) instead of the CDNA-class default"),
+      llvm::cl::init(false),
+  };
   Option<bool> enableAggressiveReshapeMovement{
       *this,
       "aggressive-reshape-movement",
