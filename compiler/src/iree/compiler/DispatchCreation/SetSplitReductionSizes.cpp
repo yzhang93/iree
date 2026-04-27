@@ -144,26 +144,35 @@ getConvolutionLimitParallelLoops(int64_t outputSize, int64_t reductionSize,
   if (outputSize < 128 * 128) {
     return 128;
   }
+  // 2D (outputSize, reductionSize) heuristic. Within each outputSize band
+  // the optimal split count depends on how much reduction work there is.
+  // Small-GPU (RDNA4) prefers fewer splits than CDNA4 because each split
+  // already saturates the GPU; CDNA4 splits more aggressively when the
+  // reduction is huge to give every CU enough work.
   if (outputSize < 256 * 256) {
     if (reductionSize < 50000) {
-      return smallGpu ? 8 : 64;
+      return smallGpu ? 8 : 16;
+    }
+    if (reductionSize < 200000) {
+      return smallGpu ? 16 : 32;
     }
     return smallGpu ? 16 : 64;
   }
   if (outputSize < 512 * 512) {
-    if (reductionSize >= 400000) {
-      return smallGpu ? 64 : 16;
+    // Both archs agree on 64 once the reduction is very large.
+    if (reductionSize >= 800000) {
+      return 64;
     }
-    if (reductionSize >= 200000) {
-      return smallGpu ? 32 : 16;
+    // Small-GPU mid-band [200k, 400k) keeps its 32-way step; CDNA4
+    // stays at 16 until the 800k threshold above.
+    if (smallGpu && reductionSize >= 200000) {
+      return 32;
     }
     return 16;
   }
   // outputSize >= 512 * 512.
-  if (outputSize >= 1024 * 1024) {
-    if (smallGpu && reductionSize >= 200000) {
-      return 16;
-    }
+  if (outputSize >= 1024 * 1024 && reductionSize >= 200000) {
+    return 16;
   }
   return std::min<int64_t>(8, startTileSize);
 }
@@ -293,9 +302,11 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
     return std::nullopt;
   }
 
-  // Skip: small-GPU shapes with huge output and modest reduction.
+  // Skip: huge output with modest reduction -- splitting introduces
+  // overhead (extra workgroups, partial-result reductions) that the
+  // per-split compute work is too small to amortise on either arch.
   int64_t outputSize = outputChannelSize * batchSize * imageSize * depthSize;
-  if (smallGpu && outputSize >= 2 * 1024 * 1024 && reductionSize < 50000) {
+  if (outputSize >= 2 * 1024 * 1024 && reductionSize < 50000) {
     LDBG() << "skipping op; huge output with modest reduction";
     return std::nullopt;
   }
@@ -473,16 +484,13 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
     return std::nullopt;
   }
 
-  // Skip: huge output with modest reduction -- splitting just adds overhead.
-  if (outputSize > 2 * 1024 * 1024 && kSize < 50000) {
-    LDBG() << "skipping op; huge output with modest reduction";
-    return std::nullopt;
-  }
-  // Skip [small-GPU only]: narrow window of output 1M-1.5M with modest K --
-  // splitting costs more than it saves on RDNA-class targets.
-  if (smallGpu && outputSize >= 1024 * 1024 && outputSize < 1500000 &&
-      kSize < 100000) {
-    LDBG() << "skipping op; narrow output window with modest reduction";
+  // Skip: large output with modest reduction -- splitting overhead exceeds
+  // the payoff per workgroup. Two regimes:
+  //   - output > 2M with very small K (< 50k)
+  //   - output in [1M, 1.5M) with modest K (< 100k)
+  if ((outputSize > 2 * 1024 * 1024 && kSize < 50000) ||
+      (outputSize >= 1024 * 1024 && outputSize < 1500000 && kSize < 100000)) {
+    LDBG() << "skipping op; large output with modest reduction";
     return std::nullopt;
   }
 
