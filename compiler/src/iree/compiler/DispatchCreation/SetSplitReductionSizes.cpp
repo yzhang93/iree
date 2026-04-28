@@ -160,8 +160,8 @@ getConvolutionLimitParallelLoops(int64_t outputSize, int64_t reductionSize,
     // workgroup count from the small filter alone isn't enough; fall
     // through to 64 for red >= 300k. Small-GPU keeps 16 in the
     // [200k, 300k) band where 64 over-splits.
-    if (smallGpu && reductionSize < 300000) {
-      return 16;
+    if (reductionSize < 300000) {
+      return smallGpu ? 16 : 64;
     }
     return 64;
   }
@@ -363,47 +363,47 @@ getConvolutionReductionSizes(PartialReductionOpInterface op,
 /// varying according to the output (parallel dimension) sizes. Note that the
 /// constant thresholds are empirically derived from limited data and may not
 /// generalize to all cases.
-static std::optional<int64_t> getMatmulLimitParallelLoops(int64_t outputSize,
-                                                          int64_t kSize,
-                                                          int64_t startTileSize,
-                                                          bool smallGpu) {
-  // Tiny output or huge K: saturate the budget.
-  if (outputSize <= 16 * 16 || kSize > 1e7) {
+static std::optional<int64_t>
+getMatmulLimitParallelLoops(int64_t outputSize, int64_t reductionSize,
+                            int64_t startTileSize, bool smallGpu) {
+  // Tiny output or huge reduction: saturate the budget.
+  if (outputSize <= 16 * 16 || reductionSize > 1e7) {
     return 2048;
   }
   if (outputSize <= 64 * 64) {
     return 128;
   }
-  // Large K: keep the upstream 128 budget; small-GPU prefers a smaller
-  // budget once the output is wide enough to spread the splits.
-  if (kSize > 1e6) {
-    if (outputSize <= 128 * 128) {
+  if (outputSize <= 128 * 128) {
+    if (reductionSize > 1e6) {
       return 128;
     }
-    return smallGpu ? 8 : 128;
-  }
-  // kSize <= 1e6.
-  if (outputSize <= 128 * 128) {
-    if (kSize < 150000) {
+    // Small reductions: the small GPU is already saturated by the natural
+    // output workgroups, so coarser splitting is enough. Threshold is set
+    // below 85k to keep stride-2 1x1 backward-weight conv (n=1, H_out*W_out
+    // ~85k) on the larger split path where 64-way splitting is needed to
+    // fill the GPU.
+    if (reductionSize < 50000) {
       return smallGpu ? 8 : 64;
     }
     return 64;
   }
+  // outputSize > 128*128. With large reduction the small GPU prefers a
+  // smaller budget once the output is wide enough to spread the splits.
+  if (reductionSize > 1e6) {
+    return smallGpu ? 8 : 128;
+  }
   if (outputSize <= 256 * 256) {
-    if (kSize < 150000) {
+    if (reductionSize < 150000) {
       return smallGpu ? 8 : 32;
     }
     return 32;
   }
-  if (outputSize <= 512 * 512) {
-    return 16;
-  }
   // Mid output with moderate reduction benefits from 16 splits over the
-  // upstream default of min(8, ...).
-  if (outputSize <= 800000 && kSize >= 100000) {
-    return 16;
-  }
-  if (outputSize >= 1024 * 1024 && smallGpu && kSize >= 200000) {
+  // upstream default of min(8, ...). Tiny-reduction shapes (red < 100000)
+  // in the 512^2..1024^2 band are excluded because splitting them at all
+  // makes them slower than the unsplit baseline.
+  if (outputSize <= 512 * 512 ||
+     (outputSize <= 900 * 900 && reductionSize >= 100000)) {
     return 16;
   }
   return std::min<int64_t>(8, startTileSize);
@@ -491,12 +491,12 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
     return std::nullopt;
   }
 
-  // Skip: large output with modest reduction -- splitting overhead exceeds
-  // the payoff per workgroup. Two regimes:
-  //   - output > 2M with very small K (< 50k)
-  //   - output in [1M, 1.5M) with modest K (< 100k)
-  if ((outputSize > 2 * 1024 * 1024 && kSize < 50000) ||
-      (outputSize >= 1024 * 1024 && outputSize < 1500000 && kSize < 100000)) {
+  // Skip: moderately large output with modest reduction -- the natural
+  // workgroup count from output-tiling already saturates the GPU. The upper
+  // output bound (1.5M) avoids shapes where partial M/N tiles make the
+  // unsplit kernel underperform a lightly-split one (e.g. M=1134, N=2048).
+  if (outputSize >= 1024 * 1024 && outputSize < 1500 * 1024 &&
+      kSize < 200 * 1000) {
     LDBG() << "skipping op; large output with modest reduction";
     return std::nullopt;
   }
