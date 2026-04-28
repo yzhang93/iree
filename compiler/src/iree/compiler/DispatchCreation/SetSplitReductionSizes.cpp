@@ -156,7 +156,14 @@ getConvolutionLimitParallelLoops(int64_t outputSize, int64_t reductionSize,
     if (reductionSize < 200000) {
       return smallGpu ? 16 : 32;
     }
-    return smallGpu ? 16 : 64;
+    // Huge reductions saturate the GPU on both archs once the natural
+    // workgroup count from the small filter alone isn't enough; fall
+    // through to 64 for red >= 300k. Small-GPU keeps 16 in the
+    // [200k, 300k) band where 64 over-splits.
+    if (smallGpu && reductionSize < 300000) {
+      return 16;
+    }
+    return 64;
   }
   if (outputSize < 512 * 512) {
     // Both archs agree on 64 once the reduction is very large.
