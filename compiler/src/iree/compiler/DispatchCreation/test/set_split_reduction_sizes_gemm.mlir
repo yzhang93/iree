@@ -31,6 +31,18 @@ util.func public @split_balanced_matmul_small_gpu(%arg0: tensor<128x32768xbf16>,
 
 // -----
 
+util.func public @split_mid_output_small_k_gpu(%arg0: tensor<128x131072xbf16>, %arg1: tensor<131072x256xbf16>, %arg2: tensor<128x256xf32>) -> tensor<128x256xf32> {
+  %0 = linalg.matmul ins(%arg0, %arg1 : tensor<128x131072xbf16>, tensor<131072x256xbf16>) outs(%arg2 : tensor<128x256xf32>) -> tensor<128x256xf32>
+  util.return %0 : tensor<128x256xf32>
+}
+
+// CHECK-LABEL: @split_mid_output_small_k_gpu
+//       CHECK: iree_linalg_ext.split_reduction = [4096 : index]
+// RDNA-LABEL: @split_mid_output_small_k_gpu
+//       RDNA: iree_linalg_ext.split_reduction = [16384 : index]
+
+// -----
+
 util.func public @split_very_large_k(%arg0: tensor<128x16800000xbf16>, %arg1: tensor<16800000x134xbf16>, %arg2: tensor<128x134xf32>) -> tensor<128x134xf32> {
   %0 = linalg.matmul ins(%arg0, %arg1 : tensor<128x16800000xbf16>, tensor<16800000x134xbf16>) outs(%arg2 : tensor<128x134xf32>) -> tensor<128x134xf32>
   util.return %0 : tensor<128x134xf32>
