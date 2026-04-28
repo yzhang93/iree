@@ -403,10 +403,11 @@ void DispatchCreationOptions::bindOptions(OptionsBinder &binder) {
           "Enable split-reduction for certain reduction operations."),
       llvm::cl::cat(category));
   binder.opt<bool>(
-      "iree-dispatch-creation-split-reduction-small-gpu",
-      splitReductionSmallGpu,
-      llvm::cl::desc("Use the small-GPU split-reduction parameter set "
-                     "(RDNA-class targets) instead of the CDNA-class default."),
+      "iree-dispatch-creation-split-reduction-low-parallelism",
+      splitReductionLowParallelism,
+      llvm::cl::desc("Use the low-parallelism split-reduction parameter set "
+                     "(RDNA-class targets) instead of the high-parallelism "
+                     "default (CDNA-class targets)."),
       llvm::cl::cat(category));
   binder.opt<bool>(
       "iree-dispatch-creation-enable-aggressive-reshape-movement",

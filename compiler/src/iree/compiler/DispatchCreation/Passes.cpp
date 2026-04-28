@@ -182,7 +182,7 @@ static void addDispatchRegionCreationPreprocessingPasses(
           dispatchOptions.enableSplitReduction,
           [&]() {
             SetSplitReductionSizesPassOptions options;
-            options.smallGpu = dispatchOptions.splitReductionSmallGpu;
+            options.lowParallelism = dispatchOptions.splitReductionLowParallelism;
             return DispatchCreation::createSetSplitReductionSizesPass(options);
           })
       .addPass([&]() {

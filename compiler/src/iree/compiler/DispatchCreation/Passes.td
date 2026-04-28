@@ -339,10 +339,11 @@ def SetSplitReductionSizesPass :
            "Target tile size for split reduction. Inner reduction "
            "dimensions are tiled first, with the tile size rounded "
            "up until it evenly divides the iteration domain.">,
-    Option<"smallGpu", "small-gpu", "bool", "false",
-           "If true, use the small-GPU split-reduction parameter set tuned "
-           "for RDNA-class targets (e.g. RX 9070 XT); otherwise use the "
-           "default CDNA-class set.">
+    Option<"lowParallelism", "low-parallelism", "bool", "false",
+           "If true, use the low-parallelism split-reduction parameter set "
+           "tuned for targets with limited concurrent workgroup parallelism "
+           "(e.g. RDNA-class GPUs); otherwise use the default set tuned for "
+           "high-parallelism targets (e.g. CDNA-class GPUs).">
   ];
   let dependentDialects = [];
 }
